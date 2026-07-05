@@ -1,0 +1,39 @@
+[package]
+name        = "mihomoctl-core"
+description = "Mihomo RESTful API"
+version     = "0.4.2"
+authors     = ["George Miao <gm@miao.dev>"]
+repository  = "git@github.com:zouxiaoliang/mihomoctl.git"
+license     = "MIT"
+edition     = "2021"
+keywords    = ["mihomo", "clash", "api"]
+categories  = ["command-line-utilities"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default     = []
+deserialize = ["chrono", "semver"]
+enum_ext    = ["strum"]
+full        = ["deserialize", "enum_ext"]
+
+[dependencies]
+cfg-if      = "1.0"
+mod_use     = "0.2.1"
+serde_json  = "1.0"
+thiserror   = "1.0"
+urlencoding = "2.1"
+
+log   = { version = "0.4", features = ["std"] }
+url   = { version = "2.2", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+ureq  = { version = "2.3", default-features = false }
+tungstenite = "0.21"
+
+strum  = { version = "~0.24.1", features = ["derive"], optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+semver = { version = "1.0", features = ["serde"], optional = true }
+
+[dev-dependencies]
+home              = "~0.5.3"
+pretty_env_logger = "0.4.0"

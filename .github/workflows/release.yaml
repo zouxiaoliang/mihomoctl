@@ -1,0 +1,42 @@
+name: Release
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Release
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-lates, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Setup toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+          default: true
+
+      - name: Run cargo build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --all-features --release
+
+      - name: Rename build artifacts
+        run: |
+          pushd target/release
+          rm mihomoctl*.d
+          mv mihomoctl* mihomoctl-${{ runner.os }}
+          popd
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: target/release/mihomoctl*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

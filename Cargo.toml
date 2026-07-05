@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["mihomoctl*"]
+
+[profile.release]
+lto           = true
+strip         = true
+panic         = "abort"
+opt-level     = "z"
+codegen-units = 1
