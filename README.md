@@ -86,25 +86,31 @@ selector            -       All
 
 ### 已完成与待办 <a name = "todo"></a>
 
-- [ ] CLI
-  - [x] 管理服务器
-  - [x] 代理排序
-  - [ ] 更多功能
-- [ ] TUI
-  - [x] 状态面板
-  - [x] 代理面板
-    - [x] 更新代理
-    - [x] 测试延迟
-    - [x] 按 {原始顺序、延迟升序、延迟降序、名称升序、名称降序} 排序
-  - [x] 规则面板
-  - [x] 连接面板
-    - [ ] 排序
-  - [x] 日志面板
-  - [x] 调试面板
-  - [ ] 配置面板
-    - [ ] 更新 mihomo 配置
-    - [ ] 更新 mihomoctl 配置
-  - [ ] 搜索
+- [x] 项目基础
+  - [x] 从 [George-Miao/clashctl](https://github.com/George-Miao/clashctl) fork 并重命名为 `mihomoctl`
+  - [x] 更新 crate 名称、二进制名称、配置目录与仓库地址
+  - [x] README 中文化，并保留原始上游仓库路径
+- [x] CLI
+  - [x] 管理服务器：添加、选择、查看、移除
+  - [x] 列出代理，支持排序、包含/排除类型、反向排序、普通/分组显示
+  - [x] 交互式切换代理
+  - [x] 生成 shell 补全脚本
+- [x] TUI
+  - [x] 状态、代理、规则、连接、日志、配置、调试面板
+  - [x] Core、DNS、APIs 分页调用 Mihomo API
+  - [x] 代理切换、延迟测试、排序与搜索
+  - [x] 规则、连接、日志列表搜索
+  - [x] 连接列表排序
+- [x] Mihomo API
+  - [x] 补充 [MetaCubeX Mihomo API 文档](https://wiki.metacubex.one/api/) 中的 REST 接口
+  - [x] 支持日志、流量、内存、连接等 WebSocket/流式接口
+  - [x] 支持 DNS、存储、规则集合、代理集合、DEBUG、核心升级等端点
+- [ ] 待完善
+  - [ ] 配置面板支持表单化编辑 mihomo 配置
+  - [ ] 配置面板支持表单化编辑 mihomoctl 本地配置
+  - [ ] CLI 覆盖更多 MetaCubeX API 操作
+  - [ ] 为需要真实 Mihomo 服务的集成测试补充环境说明
+  - [ ] 完善 release 工作流与发布产物说明
   - [ ] 鼠标支持（可能）
 
 ## 前置条件 <a name = "prerequisites"></a>
