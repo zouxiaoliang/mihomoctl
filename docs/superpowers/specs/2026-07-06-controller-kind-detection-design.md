@@ -2,7 +2,7 @@
 
 ## Goal
 
-Support both Clash and Mihomo external controller APIs in one tool. When adding a server, `mihomoctl` should call `/version` to detect the controller kind automatically, and fall back to a manual `clash` or `mihomo` selection when detection cannot make a confident decision.
+Support both Clash and Mihomo external controller APIs in one tool. When adding a server, `mihomoctl` should call `/version` to detect the controller kind automatically, then ask the user to confirm or correct the detected kind before saving it.
 
 ## Context
 
@@ -29,10 +29,11 @@ During `mihomoctl server add`:
 2. Build a temporary controller client with those values.
 3. Call `GET /version`.
 4. If the response shape or version text clearly identifies Mihomo, store `ControllerKind::Mihomo`.
-5. If the response matches only Clash's common version shape and has no Mihomo marker, store `ControllerKind::Clash`.
-6. If the request fails, authentication fails, the body is malformed, or the response is unknown, ask the user to choose `clash` or `mihomo`.
+5. If the response matches only Clash's common version shape and has no Mihomo marker, use `ControllerKind::Clash` as the suggested value.
+6. If the request fails, authentication fails, the body is malformed, or the response is unknown, use `ControllerKind::Mihomo` as the fallback suggested value.
+7. Always ask the user to confirm the controller kind with a `clash` or `mihomo` selection before saving. The detected or fallback value is the default choice, and the user can change it if the probe was wrong.
 
-The manual fallback should be presented as a normal prompt, not as an error. A failed probe should not prevent adding a server because users may add offline or firewalled controllers.
+The confirmation prompt should be presented as a normal prompt, not as an error. A failed probe should not prevent adding a server because users may add offline or firewalled controllers.
 
 ## API Capability Model
 
@@ -90,7 +91,8 @@ Add tests for:
 - Serializing a new `Server` includes the selected kind.
 - Version detection identifies a Mihomo response.
 - Version detection identifies a Clash response.
-- Version detection returns an unknown result on request or parse failure so the caller can ask manually.
+- Version detection returns an unknown result on request or parse failure so the caller can present a manual confirmation with a fallback default.
+- The detected controller kind is used as the default confirmation choice, but both `mihomo` and `clash` remain selectable.
 - The Clash API catalog excludes Mihomo-only operations such as memory, cache, group, storage, debug, and websocket operations.
 - The Mihomo API catalog still contains the full current catalog.
 - Invoking a Mihomo-only operation while configured as Clash returns a local unsupported-operation message without making a request.

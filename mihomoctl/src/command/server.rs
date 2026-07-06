@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use clap::Subcommand;
 use log::{debug, info, warn};
 use owo_colors::OwoColorize;
@@ -6,11 +8,29 @@ use terminal_size::{terminal_size, Height, Width};
 use url::Url;
 
 use crate::{
-    interactive::{Flags, Server},
+    interactive::{detect_controller_kind, ControllerKind, Flags, Server},
     Result,
 };
 
 // use crate::Result;
+
+fn controller_kind_choices() -> [&'static str; 2] {
+    [ControllerKind::Mihomo.as_str(), ControllerKind::Clash.as_str()]
+}
+
+fn controller_kind_default_index(detected: Option<ControllerKind>) -> usize {
+    match detected.unwrap_or_default() {
+        ControllerKind::Mihomo => 0,
+        ControllerKind::Clash => 1,
+    }
+}
+
+fn controller_kind_from_choice(choice: &str) -> ControllerKind {
+    match choice {
+        "clash" => ControllerKind::Clash,
+        _ => ControllerKind::Mihomo,
+    }
+}
 
 #[derive(Subcommand, Debug)]
 #[clap(about = "Interacting with servers")]
@@ -52,10 +72,33 @@ impl ServerSubcommand {
 
                 let url_str = res.remove("url").unwrap().try_into_string().unwrap();
                 let url = Url::parse(&url_str).unwrap();
+                let detected = detect_controller_kind(
+                    &url,
+                    secret.as_deref(),
+                    Some(Duration::from_millis(flags.timeout)),
+                );
+                if let Some(kind) = detected {
+                    info!("Detected {} controller", kind);
+                } else {
+                    warn!("Unable to detect controller type from /version");
+                };
+                let message = match detected {
+                    Some(kind) => format!("Confirm controller type (detected {kind})"),
+                    None => "Select controller type".to_owned(),
+                };
+                let ans = prompt_one(
+                    Question::select("kind")
+                        .message(message)
+                        .choices(controller_kind_choices())
+                        .default(controller_kind_default_index(detected))
+                        .build(),
+                )?;
+                let kind = controller_kind_from_choice(&ans.as_list_item().unwrap().text);
 
                 let server = Server {
                     secret,
                     url: url.clone(),
+                    kind,
                 };
 
                 info!("Adding {}", server);
@@ -89,7 +132,7 @@ impl ServerSubcommand {
                 let (Width(terminal_width), _) = terminal_size().unwrap_or((Width(70), Height(0)));
                 let active = config.using_server();
                 println!("\n{:-<1$}", "", terminal_width as usize);
-                println!("{:<8}{:<50}", "ACTIVE".green(), "URL");
+                println!("{:<8}{:<10}{:<50}", "ACTIVE".green(), "KIND", "URL");
                 println!("{:-<1$}", "", terminal_width as usize);
                 for server in &config.servers {
                     let is_active = match active {
@@ -97,8 +140,9 @@ impl ServerSubcommand {
                         _ => false,
                     };
                     println!(
-                        "{:^8}{:<50}",
+                        "{:^8}{:<10}{:<50}",
                         if is_active { "→".green() } else { "".green() },
+                        server.kind.as_str(),
                         server.url.as_str(),
                     )
                 }
@@ -155,5 +199,28 @@ impl ServerSubcommand {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detected_controller_kind_is_default_confirmation_choice() {
+        assert_eq!(
+            controller_kind_default_index(Some(ControllerKind::Mihomo)),
+            0
+        );
+        assert_eq!(
+            controller_kind_default_index(Some(ControllerKind::Clash)),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_controller_kind_defaults_to_mihomo_but_keeps_clash_choice() {
+        assert_eq!(controller_kind_default_index(None), 0);
+        assert_eq!(controller_kind_choices(), ["mihomo", "clash"]);
     }
 }

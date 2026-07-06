@@ -10,7 +10,7 @@ use log::warn;
 use rayon::prelude::*;
 
 use crate::{
-    interactive::Flags,
+    interactive::{ControllerKind, Flags, InteractiveError},
     ui::{
         event::{Event, UpdateEvent},
         utils::{Interval, Pulse},
@@ -21,7 +21,13 @@ use crate::{
 pub type Job = JoinHandle<TuiResult<()>>;
 
 pub fn servo(tx: Sender<Event>, rx: Receiver<Action>, opt: TuiOpt, flags: Flags) -> TuiResult<()> {
-    let clash = flags.connect_server_from_config()?;
+    let config = flags.get_config()?;
+    let server = config
+        .using_server()
+        .ok_or(InteractiveError::ServerNotFound)?
+        .to_owned();
+    let controller_kind = server.kind;
+    let clash = server.into_clash_with_timeout(Some(Duration::from_millis(flags.timeout)))?;
     clash.get_version()?;
 
     scope(|r| -> TuiResult<()> {
@@ -34,18 +40,24 @@ pub fn servo(tx: Sender<Event>, rx: Receiver<Action>, opt: TuiOpt, flags: Flags)
         let tx_clone = tx.clone();
         let handle3 = r.spawn(|| log_job(tx_clone, &clash));
 
-        let tx_clone = tx.clone();
-        let handle4 = r.spawn(|| memory_job(tx_clone, &clash));
+        let handle4 = if controller_kind == ControllerKind::Mihomo {
+            let tx_clone = tx.clone();
+            Some(r.spawn(|| memory_job(tx_clone, &clash)))
+        } else {
+            None
+        };
 
         let tx_clone = tx.clone();
         let handle5 = r.spawn(|| req_job(&opt, &flags, tx_clone, &clash));
 
-        let handle6 = r.spawn(|| action_job(&opt, &flags, tx, rx, &clash));
+        let handle6 = r.spawn(|| action_job(&opt, &flags, tx, rx, &clash, controller_kind));
 
         handle1.join().unwrap()?;
         handle2.join().unwrap()?;
         handle3.join().unwrap()?;
-        handle4.join().unwrap()?;
+        if let Some(handle4) = handle4 {
+            handle4.join().unwrap()?;
+        }
         handle5.join().unwrap()?;
         handle6.join().unwrap()?;
 
@@ -75,26 +87,58 @@ fn req_job(_opt: &TuiOpt, _flags: &Flags, tx: Sender<Event>, clash: &Clash) -> T
     let mut version_pulse = Pulse::new(102); //   Every 5 s + 2 tick
     let mut config_pulse = Pulse::new(103); //    Every 5 s + 3 tick
 
+    send_update(&tx, "version", || clash.get_version(), UpdateEvent::Version)?;
+    send_update(
+        &tx,
+        "connections",
+        || clash.get_connections().map(Into::into),
+        UpdateEvent::Connection,
+    )?;
+    send_update(&tx, "rules", || clash.get_rules(), UpdateEvent::Rules)?;
+    send_update(&tx, "proxies", || clash.get_proxies(), UpdateEvent::Proxies)?;
+    send_update(&tx, "configs", || clash.get_configs(), UpdateEvent::Config)?;
+
     loop {
         if version_pulse.tick() {
-            tx.send(Event::Update(UpdateEvent::Version(clash.get_version()?)))?;
+            send_update(&tx, "version", || clash.get_version(), UpdateEvent::Version)?;
         }
         if connection_pulse.tick() {
-            tx.send(Event::Update(UpdateEvent::Connection(
-                clash.get_connections()?.into(),
-            )))?;
+            send_update(
+                &tx,
+                "connections",
+                || clash.get_connections().map(Into::into),
+                UpdateEvent::Connection,
+            )?;
         }
         if rules_pulse.tick() {
-            tx.send(Event::Update(UpdateEvent::Rules(clash.get_rules()?)))?;
+            send_update(&tx, "rules", || clash.get_rules(), UpdateEvent::Rules)?;
         }
         if proxies_pulse.tick() {
-            tx.send(Event::Update(UpdateEvent::Proxies(clash.get_proxies()?)))?;
+            send_update(&tx, "proxies", || clash.get_proxies(), UpdateEvent::Proxies)?;
         }
         if config_pulse.tick() {
-            tx.send(Event::Update(UpdateEvent::Config(clash.get_configs()?)))?;
+            send_update(&tx, "configs", || clash.get_configs(), UpdateEvent::Config)?;
         }
         interval.tick();
     }
+}
+
+fn send_update<T, E, F, M>(
+    tx: &Sender<Event>,
+    label: &str,
+    fetch: F,
+    into_update: M,
+) -> TuiResult<()>
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Result<T, E>,
+    M: FnOnce(T) -> UpdateEvent,
+{
+    match fetch() {
+        Ok(value) => tx.send(Event::Update(into_update(value)))?,
+        Err(error) => warn!("Failed to refresh {label}: {error}"),
+    }
+    Ok(())
 }
 
 fn traffic_job(tx: Sender<Event>, clash: &Clash) -> TuiResult<()> {
@@ -136,6 +180,7 @@ fn action_job(
     tx: Sender<Event>,
     rx: Receiver<Action>,
     clash: &Clash,
+    controller_kind: ControllerKind,
 ) -> TuiResult<()> {
     while let Ok(action) = rx.recv() {
         tx.send(Event::Action(action.clone()))?;
@@ -174,7 +219,13 @@ fn action_job(
                 tx.send(Event::Update(UpdateEvent::Proxies(clash.get_proxies()?)))?;
             }
             Action::InvokeApi { operation, params } => {
-                let result = operation.invoke(&params, clash, flags.test_url.as_str(), flags.timeout);
+                let result = operation.invoke_for_kind(
+                    &params,
+                    clash,
+                    controller_kind,
+                    flags.test_url.as_str(),
+                    flags.timeout,
+                );
                 tx.send(Event::Update(UpdateEvent::ApiResult {
                     operation,
                     result,
@@ -183,4 +234,49 @@ fn action_job(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::channel;
+
+    use mihomoctl_core::model::{Version, VersionPayload};
+
+    use super::*;
+    use crate::ui::{event::UpdateEvent, TuiError};
+
+    fn version() -> Version {
+        Version {
+            premium: None,
+            version: VersionPayload::Raw("test".to_owned()),
+        }
+    }
+
+    #[test]
+    fn send_update_emits_successful_refresh() {
+        let (tx, rx) = channel();
+
+        send_update(&tx, "version", || Ok::<_, TuiError>(version()), UpdateEvent::Version)
+            .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::Update(UpdateEvent::Version(_))
+        ));
+    }
+
+    #[test]
+    fn send_update_keeps_refresh_job_alive_when_one_request_fails() {
+        let (tx, rx) = channel();
+
+        send_update(
+            &tx,
+            "version",
+            || Err::<Version, _>(TuiError::TuiInternalErr),
+            UpdateEvent::Version,
+        )
+        .unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
 }

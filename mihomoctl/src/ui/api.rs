@@ -15,6 +15,7 @@ use tui::{
 };
 
 use crate::{
+    interactive::ControllerKind,
     ui::{
         components::{MovableListItem, MovableListManage, MovableListState},
         utils::get_text_style,
@@ -349,6 +350,37 @@ impl ApiOperation {
         Self::DebugPprofHeap,
     ];
 
+    pub fn supports(self, kind: ControllerKind) -> bool {
+        match kind {
+            ControllerKind::Mihomo => true,
+            ControllerKind::Clash => {
+                use ApiOperation::*;
+                matches!(
+                    self,
+                    Logs
+                        | Traffic
+                        | Version
+                        | GetConfigs
+                        | ReloadConfigs
+                        | PatchConfigs
+                        | GetProxies
+                        | GetProxy
+                        | SelectProxy
+                        | GetProxyDelay
+                        | GetRules
+                        | GetConnections
+                        | CloseConnections
+                        | CloseConnection
+                        | GetProxyProviders
+                        | GetProxyProvider
+                        | UpdateProxyProvider
+                        | HealthcheckProxyProvider
+                        | DnsQuery
+                )
+            }
+        }
+    }
+
     pub fn method(self) -> &'static str {
         use ApiOperation::*;
         match self {
@@ -606,6 +638,21 @@ impl ApiOperation {
         }
     }
 
+    pub fn invoke_for_kind(
+        self,
+        params: &ApiParams,
+        clash: &Clash,
+        kind: ControllerKind,
+        test_url: &str,
+        timeout: u64,
+    ) -> String {
+        if !self.supports(kind) {
+            return format!("operation requires mihomo controller: {}", self.title());
+        }
+
+        self.invoke(params, clash, test_url, timeout)
+    }
+
     pub fn invoke(self, params: &ApiParams, clash: &Clash, test_url: &str, timeout: u64) -> String {
         use ApiOperation::*;
         match self {
@@ -757,6 +804,15 @@ impl ApiItem {
 
     pub fn catalog() -> Vec<Self> {
         Self::catalog_for(ApiOperation::ALL)
+    }
+
+    pub fn catalog_for_kind(kind: ControllerKind) -> Vec<Self> {
+        let operations = ApiOperation::ALL
+            .iter()
+            .copied()
+            .filter(|operation| operation.supports(kind))
+            .collect::<Vec<_>>();
+        Self::catalog_for(&operations)
     }
 
     pub fn catalog_for(operations: &[ApiOperation]) -> Vec<Self> {
@@ -927,9 +983,17 @@ pub fn default_api_state<'a>() -> ApiListState<'a> {
     api_state_for(ApiItem::catalog())
 }
 
+pub fn api_state_for_kind<'a>(kind: ControllerKind) -> ApiListState<'a> {
+    api_state_for(ApiItem::catalog_for_kind(kind))
+}
+
 pub fn config_core_api_state<'a>() -> ApiListState<'a> {
+    config_core_api_state_for_kind(ControllerKind::Mihomo)
+}
+
+pub fn config_core_api_state_for_kind<'a>(kind: ControllerKind) -> ApiListState<'a> {
     use ApiOperation::*;
-    api_state_for(ApiItem::catalog_for(&[
+    let operations = [
         GetConfigs,
         ReloadConfigs,
         PatchConfigs,
@@ -938,12 +1002,24 @@ pub fn config_core_api_state<'a>() -> ApiListState<'a> {
         Upgrade,
         UpgradeUi,
         UpgradeGeo,
-    ]))
+    ]
+    .into_iter()
+    .filter(|operation| operation.supports(kind))
+    .collect::<Vec<_>>();
+    api_state_for(ApiItem::catalog_for(&operations))
 }
 
 pub fn dns_api_state<'a>() -> ApiListState<'a> {
+    dns_api_state_for_kind(ControllerKind::Mihomo)
+}
+
+pub fn dns_api_state_for_kind<'a>(kind: ControllerKind) -> ApiListState<'a> {
     use ApiOperation::*;
-    api_state_for(ApiItem::catalog_for(&[FlushFakeIpCache, FlushDnsCache, DnsQuery]))
+    let operations = [FlushFakeIpCache, FlushDnsCache, DnsQuery]
+        .into_iter()
+        .filter(|operation| operation.supports(kind))
+        .collect::<Vec<_>>();
+    api_state_for(ApiItem::catalog_for(&operations))
 }
 
 fn api_state_for<'a>(items: Vec<ApiItem>) -> ApiListState<'a> {
@@ -1636,6 +1712,60 @@ mod tests {
         assert!(contains_operation(ApiOperation::TrafficWs));
         assert!(contains_operation(ApiOperation::MemoryWs));
         assert!(contains_operation(ApiOperation::ConnectionsWs));
+    }
+
+    #[test]
+    fn clash_api_catalog_excludes_mihomo_only_operations() {
+        let clash = api_state_for_kind(ControllerKind::Clash)
+            .iter()
+            .map(|item| item.operation)
+            .collect::<Vec<_>>();
+
+        for operation in [
+            ApiOperation::Memory,
+            ApiOperation::MemoryWs,
+            ApiOperation::FlushFakeIpCache,
+            ApiOperation::GetGroups,
+            ApiOperation::Restart,
+            ApiOperation::DisableRules,
+            ApiOperation::GetStorage,
+            ApiOperation::DebugPprof,
+            ApiOperation::ConnectionsWs,
+        ] {
+            assert!(!clash.contains(&operation), "{operation:?} should be hidden");
+        }
+
+        assert!(clash.contains(&ApiOperation::Version));
+        assert!(clash.contains(&ApiOperation::GetProxies));
+        assert!(clash.contains(&ApiOperation::DnsQuery));
+    }
+
+    #[test]
+    fn mihomo_api_catalog_keeps_full_catalog() {
+        let mihomo = api_state_for_kind(ControllerKind::Mihomo)
+            .iter()
+            .map(|item| item.operation)
+            .collect::<Vec<_>>();
+        let full = default_api_state()
+            .iter()
+            .map(|item| item.operation)
+            .collect::<Vec<_>>();
+
+        assert_eq!(mihomo, full);
+    }
+
+    #[test]
+    fn unsupported_mihomo_operation_is_guarded_before_request() {
+        let clash = Clash::builder("http://127.0.0.1:1").unwrap().build();
+        let result = ApiOperation::Memory.invoke_for_kind(
+            &ApiParams::default(),
+            &clash,
+            ControllerKind::Clash,
+            "http://example.com",
+            2000,
+        );
+
+        assert!(result.contains("requires mihomo controller"));
     }
 
     #[test]

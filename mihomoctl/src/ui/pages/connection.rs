@@ -81,3 +81,31 @@ impl<'a> MovableListItem<'a> for ConnectionWithSpeed {
         .into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+    use super::*;
+    use crate::{ui::config::init_config, Config, TuiStates};
+
+    fn rendered_text(buf: &Buffer, area: Rect) -> String {
+        (0..area.height)
+            .flat_map(|y| {
+                (0..area.width).map(move |x| buf.get(x, y).symbol.as_str().to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_connection_page_explains_there_are_no_active_connections() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-connection-page-test.ron").unwrap());
+        let state = TuiStates::default();
+        let area = Rect::new(0, 0, 80, 6);
+        let mut buf = Buffer::empty(area);
+
+        ConnectionPage::new(&state).render(area, &mut buf);
+
+        assert!(rendered_text(&buf, area).contains("No active connections"));
+    }
+}

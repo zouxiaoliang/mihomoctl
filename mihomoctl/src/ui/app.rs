@@ -67,10 +67,11 @@ pub fn main_loop(opt: TuiOpt, flag: Flags) -> TuiResult<()> {
         );
         return Ok(());
     };
+    let controller_kind = config.using_server().map(|server| server.kind).unwrap_or_default();
 
     init_config(config);
 
-    let state = Arc::new(RwLock::new(TuiStates::default()));
+    let state = Arc::new(RwLock::new(TuiStates::for_controller_kind(controller_kind)));
     let error = Arc::new(Mutex::new(None));
 
     let (event_tx, event_rx) = channel();

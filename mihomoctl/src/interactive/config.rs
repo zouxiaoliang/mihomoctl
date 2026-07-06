@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use mihomoctl_core::serde_json::{from_str as json_from_str, Value};
 use mihomoctl_core::{Clash, ClashBuilder};
 use log::{debug, info};
 use ron::{from_str, ser::PrettyConfig};
@@ -15,10 +16,71 @@ use url::Url;
 
 use super::{ConfigData, InteractiveError, InteractiveResult};
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum ControllerKind {
+    Clash,
+    Mihomo,
+}
+
+impl ControllerKind {
+    pub fn detect_from_version_body(body: &str) -> Option<Self> {
+        let value: Value = json_from_str(body).ok()?;
+        let object = value.as_object()?;
+
+        let body = body.to_ascii_lowercase();
+        if body.contains("mihomo")
+            || object
+                .get("meta")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Some(Self::Mihomo);
+        }
+
+        object.get("version").map(|_| Self::Clash)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clash => "clash",
+            Self::Mihomo => "mihomo",
+        }
+    }
+}
+
+impl Default for ControllerKind {
+    fn default() -> Self {
+        Self::Mihomo
+    }
+}
+
+impl Display for ControllerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn detect_controller_kind(
+    url: &Url,
+    secret: Option<&str>,
+    timeout: Option<Duration>,
+) -> Option<ControllerKind> {
+    let clash = ClashBuilder::new(url.clone())
+        .ok()?
+        .secret(secret.map(ToOwned::to_owned))
+        .timeout(timeout)
+        .build();
+    let body = clash.oneshot_req("version", "GET").ok()?;
+    ControllerKind::detect_from_version_body(&body)
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct Server {
     pub url: url::Url,
     pub secret: Option<String>,
+    #[serde(default)]
+    pub kind: ControllerKind,
 }
 
 impl Server {
@@ -37,7 +99,7 @@ impl Server {
 
 impl Display for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Server ({})", self.url)
+        write!(f, "Server ({}, {})", self.url, self.kind)
     }
 }
 
@@ -177,6 +239,59 @@ fn test_config() {
     config.servers.push(Server {
         url: url::Url::parse("http://127.0.0.1:9090").unwrap(),
         secret: None,
+        kind: ControllerKind::Mihomo,
     });
     config.write().unwrap();
+}
+
+#[test]
+fn old_server_config_defaults_to_mihomo_kind() {
+    let server: Server = ron::from_str(
+        r#"(
+            url: "http://127.0.0.1:9090/",
+            secret: None,
+        )"#,
+    )
+    .unwrap();
+
+    assert_eq!(server.kind, ControllerKind::Mihomo);
+}
+
+#[test]
+fn new_server_config_serializes_kind() {
+    let server = Server {
+        url: url::Url::parse("http://127.0.0.1:9090/").unwrap(),
+        secret: Some("token".to_owned()),
+        kind: ControllerKind::Clash,
+    };
+
+    let serialized = ron::to_string(&server).unwrap();
+    assert!(serialized.contains("kind"));
+    assert!(serialized.contains("clash"));
+}
+
+#[test]
+fn detect_controller_kind_from_version_payloads() {
+    assert_eq!(
+        ControllerKind::detect_from_version_body(r#"{"version":"Mihomo v1.18.0"}"#),
+        Some(ControllerKind::Mihomo)
+    );
+    assert_eq!(
+        ControllerKind::detect_from_version_body(r#"{"version":"1.18.0","meta":true}"#),
+        Some(ControllerKind::Mihomo)
+    );
+    assert_eq!(
+        ControllerKind::detect_from_version_body(r#"{"version":"1.18.0"}"#),
+        Some(ControllerKind::Clash)
+    );
+    assert_eq!(ControllerKind::detect_from_version_body("not json"), None);
+}
+
+#[test]
+fn detect_controller_kind_returns_none_when_probe_fails() {
+    let url = Url::parse("ftp://127.0.0.1:9090").unwrap();
+    assert_eq!(
+        detect_controller_kind(&url, None, Some(Duration::from_millis(20))),
+        None
+    );
 }

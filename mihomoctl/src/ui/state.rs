@@ -12,7 +12,7 @@ use tui::{
 };
 
 use crate::{
-    interactive::{ConSort, Noop, RuleSort},
+    interactive::{ConSort, ControllerKind, Noop, RuleSort},
     ui::{
         api::{self, ApiListState},
         components::{MovableListManage, MovableListManager, MovableListState, ProxyTree},
@@ -80,6 +80,7 @@ fn default_connection_state<'a>() -> ConListState<'a> {
         ),
         Style::default().fg(Color::DarkGray),
     )));
+    state.placeholder("No active connections");
     state
 }
 
@@ -96,6 +97,15 @@ impl<'a> TuiStates<'a> {
         "Configs",
         "Debug",
     ];
+
+    pub fn for_controller_kind(kind: ControllerKind) -> Self {
+        Self {
+            config_core_api_state: api::config_core_api_state_for_kind(kind),
+            dns_api_state: api::dns_api_state_for_kind(kind),
+            api_state: api::api_state_for_kind(kind),
+            ..Self::default()
+        }
+    }
 
     pub fn handle(&mut self, event: Event) -> TuiResult<Option<Action>> {
         self.all_events_recv += 1;
@@ -588,7 +598,7 @@ mod tests {
 
     use crate::{
         mihomoctl::model::{ConnectionWithSpeed, ConnectionsWithSpeed, Level, Log},
-        interactive::{Config, ConSort},
+        interactive::{Config, ConSort, ControllerKind},
         ui::api::{self, ApiOperation},
         ui::components::MovableListState,
         ui::config::init_config,
@@ -681,6 +691,39 @@ mod tests {
         assert_eq!(
             api::current_operation(state.active_api_state().unwrap()),
             Some(ApiOperation::Version)
+        );
+    }
+
+    #[test]
+    fn tui_state_uses_controller_kind_for_api_catalogs() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-kind-state-test.ron").unwrap());
+        let clash = TuiStates::for_controller_kind(ControllerKind::Clash);
+        let clash_api = clash
+            .api_state
+            .iter()
+            .map(|item| item.operation)
+            .collect::<Vec<_>>();
+        let clash_dns = clash
+            .dns_api_state
+            .iter()
+            .map(|item| item.operation)
+            .collect::<Vec<_>>();
+
+        assert!(!clash_api.contains(&ApiOperation::Memory));
+        assert!(!clash_api.contains(&ApiOperation::FlushFakeIpCache));
+        assert!(clash_api.contains(&ApiOperation::Version));
+        assert_eq!(clash_dns, vec![ApiOperation::DnsQuery]);
+
+        let mihomo = TuiStates::for_controller_kind(ControllerKind::Mihomo);
+        let mihomo_api = mihomo
+            .api_state
+            .iter()
+            .map(|item| item.operation)
+            .collect::<Vec<_>>();
+        assert!(mihomo_api.contains(&ApiOperation::Memory));
+        assert_eq!(
+            api::current_operation(&mihomo.dns_api_state),
+            Some(ApiOperation::FlushFakeIpCache)
         );
     }
 

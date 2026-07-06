@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{RuleType, TimeType};
 
+fn null_connections_default<'de, D>(deserializer: D) -> Result<Vec<Connection>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Connection>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
@@ -35,6 +42,7 @@ pub struct Connection {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct Connections {
+    #[serde(default, deserialize_with = "null_connections_default")]
     pub connections: Vec<Connection>,
     pub download_total: u64,
     pub upload_total: u64,
@@ -123,5 +131,27 @@ mod deserialize {
         fn from(val: ConnectionWithSpeed) -> Self {
             val.connection
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Connections;
+
+    #[test]
+    fn connections_accepts_null_list_as_empty_list() {
+        let connections: Connections = serde_json::from_str(
+            r#"{
+                "downloadTotal": 6062698133,
+                "uploadTotal": 412273263,
+                "connections": null,
+                "memory": 37298176
+            }"#,
+        )
+        .unwrap();
+
+        assert!(connections.connections.is_empty());
+        assert_eq!(connections.download_total, 6062698133);
+        assert_eq!(connections.upload_total, 412273263);
     }
 }
