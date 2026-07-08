@@ -2,7 +2,7 @@ use clap_complete::Shell;
 use env_logger::fmt::Color;
 use env_logger::Builder;
 use log::{Level, LevelFilter};
-use std::{env, path::PathBuf};
+use std::{env, io, path::PathBuf};
 
 pub fn detect_shell() -> Option<Shell> {
     match env::var("SHELL") {
@@ -12,6 +12,14 @@ pub fn detect_shell() -> Option<Shell> {
             .and_then(|name| name.parse().ok()),
         Err(_) => None,
     }
+}
+
+pub fn terminal_width(default: u16) -> u16 {
+    terminal_width_from_size(crossterm::terminal::size(), default)
+}
+
+fn terminal_width_from_size(size: io::Result<(u16, u16)>, default: u16) -> u16 {
+    size.map(|(width, _)| width).unwrap_or(default)
 }
 
 pub fn init_logger(level: Option<LevelFilter>) {
@@ -41,4 +49,23 @@ pub fn init_logger(level: Option<LevelFilter>) {
     });
 
     builder.init()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::terminal_width_from_size;
+
+    #[test]
+    fn terminal_width_from_size_uses_reported_width() {
+        assert_eq!(terminal_width_from_size(Ok((120, 40)), 70), 120);
+    }
+
+    #[test]
+    fn terminal_width_from_size_uses_default_on_error() {
+        let err = io::Error::new(io::ErrorKind::Other, "terminal size unavailable");
+
+        assert_eq!(terminal_width_from_size(Err(err), 70), 70);
+    }
 }

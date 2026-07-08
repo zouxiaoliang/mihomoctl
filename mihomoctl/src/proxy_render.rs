@@ -1,10 +1,10 @@
-use mihomoctl_core::model::{Proxies, Proxy};
 use either::Either;
+use mihomoctl_core::model::{Proxies, Proxy};
 use owo_colors::OwoColorize;
-use terminal_size::{terminal_size, Height, Width};
 
 use crate::{
     interactive::{ProxySort, Sortable},
+    utils::terminal_width,
     ProxyListOpt,
 };
 
@@ -20,7 +20,7 @@ impl RenderList for Proxies {
     // }
 
     fn render_list(&self, opt: &ProxyListOpt) {
-        let (Width(terminal_width), _) = terminal_size().unwrap_or((Width(70), Height(0)));
+        let terminal_width = terminal_width(70);
         println!("\n{:-<1$}", "", terminal_width as usize);
         println!("{:<18}{:<8}NAME", "TYPE", "DELAY");
         println!("{:-<1$}", "", terminal_width as usize);

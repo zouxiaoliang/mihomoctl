@@ -18,7 +18,6 @@ mod_use = "0.2.1"
 log           = { version = "~0.4", features = ["std"] }
 url           = { version = "~2.2", features = ["serde"] }
 thiserror     = { version = "~1.0" }
-terminal_size = { version = "~0.2" }
 owo-colors    = { version = "~3.4" }
 env_logger    = { version = "~0.9" }
 requestty     = { version = "~0.4" }

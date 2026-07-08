@@ -4,11 +4,11 @@ use clap::Subcommand;
 use log::{debug, info, warn};
 use owo_colors::OwoColorize;
 use requestty::{prompt, prompt_one, Answers, Question};
-use terminal_size::{terminal_size, Height, Width};
 use url::Url;
 
 use crate::{
     interactive::{detect_controller_kind, ControllerKind, Flags, Server},
+    utils::terminal_width,
     Result,
 };
 
@@ -129,7 +129,7 @@ impl ServerSubcommand {
                     warn!("No server configured yet. Use `mihomoctl server add` first.");
                     return Ok(());
                 }
-                let (Width(terminal_width), _) = terminal_size().unwrap_or((Width(70), Height(0)));
+                let terminal_width = terminal_width(70);
                 let active = config.using_server();
                 println!("\n{:-<1$}", "", terminal_width as usize);
                 println!("{:<8}{:<10}{:<50}", "ACTIVE".green(), "KIND", "URL");
