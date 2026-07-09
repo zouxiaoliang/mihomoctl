@@ -51,6 +51,12 @@ jobs:
       - name: Install target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Setup cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
       - name: Run cargo build
         run: cargo build --all-features --release --locked --target ${{ matrix.target }}
 
