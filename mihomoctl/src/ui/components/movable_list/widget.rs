@@ -156,12 +156,26 @@ where
 
         let height = list_inner.height as usize;
 
-        // Calculate which portion of the list will be displayed
-        let y_offset = if offset.y + 1 > num {
+        // The cursor position in visible order
+        let cursor = if offset.y + 1 > num {
             num.saturating_sub(1)
         } else {
             offset.y
         };
+
+        // Scroll window with hysteresis: the cursor walks the page and the
+        // window only follows once the cursor crosses its edges.
+        let mut window_start = self.state.window_start.get();
+        if cursor < window_start {
+            window_start = cursor;
+        } else if height > 0 && cursor >= window_start + height {
+            window_start = cursor + 1 - height;
+        }
+        // Keep the window within bounds when the list shrinks
+        window_start = window_start.min(num.saturating_sub(height.max(1)));
+        self.state.window_start.set(window_start);
+
+        let y_offset = window_start;
 
         let x_offset = offset.x;
 
@@ -215,7 +229,7 @@ where
                             ),
                         );
                     };
-                    if i == 0 {
+                    if i + y_offset == cursor {
                         for span in spans.0.iter_mut() {
                             span.style = span.style.add_modifier(Modifier::REVERSED);
                         }
@@ -266,6 +280,52 @@ mod tests {
         (0..width)
             .map(|x| buf.get(x, y).symbol.as_str())
             .collect::<String>()
+    }
+
+    fn reversed_row(buf: &Buffer, y: u16, width: u16) -> bool {
+        (0..width).any(|x| {
+            let cell = buf.get(x, y);
+            !cell.symbol.trim().is_empty()
+                && cell.modifier.contains(tui::style::Modifier::REVERSED)
+        })
+    }
+
+    #[test]
+    fn cursor_walks_down_the_page_before_the_window_scrolls() {
+        let mut state: MovableListState<'_, String, Noop> =
+            MovableListState::new((0..10).map(|i| format!("item-{i}")).collect());
+        state.normal_order();
+
+        // 6 rows total - 2 border rows = 4 visible list rows
+        let area = Rect::new(0, 0, 30, 6);
+
+        // Cursor within the first page: window stays at the top
+        state.offset.y = 2;
+        let mut buf = Buffer::empty(area);
+        MovableList::new("List", &state).render(area, &mut buf);
+        assert!(row(&buf, 1, 30).contains("item-0"));
+        assert!(reversed_row(&buf, 3, 30)); // item-2 highlighted in place
+
+        // Cursor beyond the page: window follows, cursor rides the bottom
+        state.offset.y = 5;
+        let mut buf = Buffer::empty(area);
+        MovableList::new("List", &state).render(area, &mut buf);
+        assert!(row(&buf, 1, 30).contains("item-2"));
+        assert!(row(&buf, 4, 30).contains("item-5"));
+        assert!(reversed_row(&buf, 4, 30)); // bottom row highlighted
+
+        // Moving back up: window holds until the cursor hits its top edge
+        state.offset.y = 3;
+        let mut buf = Buffer::empty(area);
+        MovableList::new("List", &state).render(area, &mut buf);
+        assert!(row(&buf, 1, 30).contains("item-2"));
+        assert!(reversed_row(&buf, 2, 30)); // item-3 highlighted in place
+
+        state.offset.y = 1;
+        let mut buf = Buffer::empty(area);
+        MovableList::new("List", &state).render(area, &mut buf);
+        assert!(row(&buf, 1, 30).contains("item-1"));
+        assert!(reversed_row(&buf, 1, 30)); // window scrolled up to the cursor
     }
 
     #[test]

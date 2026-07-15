@@ -47,6 +47,14 @@ pub struct Proxy {
     pub now: Option<String>,
 }
 
+impl Proxy {
+    /// The API appends new latency tests to the end of `history`, so the most
+    /// recent result is the last entry.
+    pub fn latest_history(&self) -> Option<&History> {
+        self.history.last()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct History {
     pub time: TimeType,

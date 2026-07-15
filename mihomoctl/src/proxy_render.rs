@@ -58,8 +58,7 @@ impl RenderList for Proxies {
 
         for (name, proxy) in iter {
             let delay = proxy
-                .history
-                .get(0)
+                .latest_history()
                 .map(|x| match x.delay {
                     0 => "?".to_owned(),
                     delay => delay.to_string(),
@@ -109,7 +108,7 @@ impl RenderList for Proxies {
             ) in members
             {
                 let delay = history
-                    .get(0)
+                    .last()
                     .map(|x| match x.delay {
                         0 => "?".to_owned(),
                         delay => delay.to_string(),

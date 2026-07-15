@@ -8,7 +8,7 @@ use tui::{
 
 use crate::{IntoSpans, Wrap};
 
-pub fn help_footer(content: &str, normal: Style, highlight: Style) -> Spans {
+pub fn help_footer<'a>(content: &'a str, normal: Style, highlight: Style) -> Spans<'a> {
     if content.is_empty() {
         Spans(vec![])
     } else if content.len() == 1 {
@@ -25,7 +25,7 @@ pub fn help_footer(content: &str, normal: Style, highlight: Style) -> Spans {
     }
 }
 
-pub fn tagged_footer<T: ToString>(label: &str, style: Style, content: T) -> Spans {
+pub fn tagged_footer<'a, T: ToString>(label: &'a str, style: Style, content: T) -> Spans<'a> {
     let mut ret = help_footer(label, style, style.add_modifier(Modifier::BOLD)).wrapped();
     ret.0.push(Span::styled(
         content.to_string().wrapped(),
@@ -98,14 +98,14 @@ pub fn spans_window_owned<'a>(mut spans: Spans<'a>, range: &Range<usize>) -> Spa
     }
 }
 
-pub fn get_block(title: &str) -> Block {
+pub fn get_block(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .style(Style::default().fg(Color::LightBlue))
         .title(Span::raw(format!(" {} ", title)))
 }
 
-pub fn get_focused_block(title: &str) -> Block {
+pub fn get_focused_block(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(

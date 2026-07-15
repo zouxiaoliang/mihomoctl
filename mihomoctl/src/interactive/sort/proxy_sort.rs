@@ -188,7 +188,7 @@ impl SortMethod<(&String, &Proxy)> for ProxySort {
         let ret = match self.by() {
             ProxySortBy::Type => a.1.proxy_type.cmp(&b.1.proxy_type),
             ProxySortBy::Name => a.0.cmp(b.0),
-            ProxySortBy::Delay => match (a.1.history.get(0), b.1.history.get(0)) {
+            ProxySortBy::Delay => match (a.1.latest_history(), b.1.latest_history()) {
                 // 0 delay means unable to connect, so handle exceptionally
                 // This will push all 0-delay proxies to the end of list
                 (Some(l_history), Some(r_history)) => match (l_history.delay, r_history.delay) {

@@ -11,7 +11,7 @@ use ureq::{Agent, Request};
 use url::Url;
 
 use crate::{
-    model::{Config, Connections, Delay, Log, Proxies, Proxy, Rules, Traffic, Version},
+    model::{Config, Connections, Delay, Log, Mode, Proxies, Proxy, Rules, Traffic, Version},
     Error, Result,
 };
 
@@ -372,8 +372,19 @@ impl Clash {
     }
 
     /// Update base configs.
-    pub fn patch_configs(&self, patch: Value) -> Result<Value> {
-        self.patch("configs", Some(patch.to_string()))
+    ///
+    /// The endpoint replies `204 No Content`, so the response body is ignored
+    /// instead of being parsed as JSON.
+    pub fn patch_configs(&self, patch: Value) -> Result<()> {
+        self.patch_empty("configs", Some(patch.to_string()))
+    }
+
+    /// Switch running mode (rule / global / direct) through `PATCH /configs`.
+    ///
+    /// The endpoint replies `204 No Content`, so the response body is ignored
+    /// instead of being parsed as JSON.
+    pub fn set_mode(&self, mode: Mode) -> Result<()> {
+        self.patch_empty("configs", Some(json!({ "mode": mode }).to_string()))
     }
 
     /// Update Geo database through `/configs/geo`.
@@ -722,7 +733,7 @@ mod metacubex_api_tests {
 
     use serde_json::json;
 
-    use super::Clash;
+    use super::{Clash, Mode};
 
     #[derive(Debug)]
     struct CapturedRequest {
@@ -835,6 +846,15 @@ mod metacubex_api_tests {
             Some(r#"{"mixed-port":7890}"#),
             |clash| {
                 clash.patch_configs(json!({ "mixed-port": 7890 })).unwrap();
+            },
+        );
+        assert_request(
+            r#"{"mode":"global"}"#,
+            "PATCH",
+            "/configs",
+            Some(r#"{"mode":"global"}"#),
+            |clash| {
+                clash.set_mode(Mode::Global).unwrap();
             },
         );
         assert_request("", "POST", "/configs/geo", None, |clash| {

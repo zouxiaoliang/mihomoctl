@@ -1,7 +1,7 @@
 [package]
 name        = "mihomoctl"
 description = "Cli & Tui used to interact with Mihomo RESTful API"
-version     = "0.3.3"
+version     = "0.1.1"
 authors     = ["George Miao <gm@miao.dev>"]
 repository  = "git@github.com:zouxiaoliang/mihomoctl.git"
 license     = "MIT"

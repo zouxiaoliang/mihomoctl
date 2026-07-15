@@ -25,7 +25,7 @@ enum ConfigListItem<'a> {
 }
 
 impl<'a> ConfigListItem<'a> {
-    pub fn title(title: &'a str) -> impl Iterator<Item = ConfigListItem> {
+    pub fn title(title: &'a str) -> impl Iterator<Item = ConfigListItem<'a>> {
         [
             ConfigListItem::Empty,
             ConfigListItem::Title(title),
@@ -41,13 +41,19 @@ impl<'a> ConfigListItem<'a> {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            ConfigListItem::Item { label, content } => ListItem::new(format!(
-                "{:<15}{:>right$}",
-                label,
-                content,
-                right = (width - 15) as usize
-            ))
-            .style(Style::default().fg(Color::White)),
+            ConfigListItem::Item { label, content } => {
+                let text = if label == "Server" {
+                    format_wrapped_value(label, &content, width as usize)
+                } else {
+                    format!(
+                        "{:<15}{:>right$}",
+                        label,
+                        content,
+                        right = (width - 15) as usize
+                    )
+                };
+                ListItem::new(text).style(Style::default().fg(Color::White))
+            }
             ConfigListItem::Separator => {
                 ListItem::new(format!("{:-<width$}", "", width = width as usize))
             }
@@ -56,6 +62,26 @@ impl<'a> ConfigListItem<'a> {
             }
         }
     }
+}
+
+fn format_wrapped_value(label: &str, value: &str, width: usize) -> String {
+    let prefix = format!("{label} ");
+    let indent = prefix.chars().count();
+    let width = width.max(indent + 1);
+    let mut line_len = indent;
+    let mut output = prefix;
+
+    for ch in value.chars() {
+        if line_len >= width {
+            output.push('\n');
+            output.extend(std::iter::repeat(' ').take(indent));
+            line_len = indent;
+        }
+        output.push(ch);
+        line_len += 1;
+    }
+
+    output
 }
 
 impl<'a> Widget for ConfigPage<'a> {
@@ -82,5 +108,26 @@ impl<'a> Widget for ConfigPage<'a> {
         };
         block.render(area, buf);
         List::new(list).render(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_wrapped_value;
+
+    #[test]
+    fn server_url_uses_the_full_config_panel_width() {
+        assert_eq!(
+            format_wrapped_value("Server", "http://192.168.8.1:9090", 31),
+            "Server http://192.168.8.1:9090"
+        );
+    }
+
+    #[test]
+    fn long_server_url_wraps_instead_of_being_truncated() {
+        let rendered = format_wrapped_value("Server", "http://example.com:9090/controller", 20);
+
+        assert_eq!(rendered.replace('\n', "").replace(' ', ""), "Serverhttp://example.com:9090/controller");
+        assert!(rendered.contains('\n'));
     }
 }

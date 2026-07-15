@@ -139,7 +139,40 @@ pub struct MovableListState<'a, T: MovableListItem<'a>, S: Default> {
     paused: bool,
     search_query: Option<String>,
     filtered_indices: Option<Vec<usize>>,
+    /// First visible row of the last rendered window. Updated during render
+    /// so the cursor walks down the page and only scrolls at the edges.
+    pub(super) window_start: WindowStart,
 }
+
+/// Render-time scroll anchor. Interior mutability is needed because widgets
+/// render from `&self`, and it has to be `Sync` as the states are shared
+/// across threads.
+#[derive(Debug, Default)]
+pub(super) struct WindowStart(std::sync::atomic::AtomicUsize);
+
+impl WindowStart {
+    pub(super) fn get(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn set(&self, value: usize) {
+        self.0.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clone for WindowStart {
+    fn clone(&self) -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(self.get()))
+    }
+}
+
+impl PartialEq for WindowStart {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for WindowStart {}
 
 impl<'a, T, S> MovableListState<'a, T, S>
 where

@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use mihomoctl_core::{
-    model::{ConnectionsWithSpeed, Log, Proxies, Rules, Traffic, Version},
+    model::{ConnectionsWithSpeed, Log, Mode, Proxies, Rules, Traffic, Version},
     serde_json::Value,
 };
 use crossterm::event::{KeyCode as KC, KeyEvent as KE, KeyModifiers as KM};
@@ -82,6 +82,7 @@ pub enum InputEvent {
     ToggleHold,
     List(ListEvent),
     TestLatency,
+    TestLatencyAll,
     NextSort,
     PrevSort,
     Other(KE),
@@ -105,6 +106,28 @@ pub enum UpdateEvent {
     Rules(Rules),
     Log(Log),
     ProxyTestLatencyDone,
+    ProxySelectionResult {
+        group: String,
+        proxy: String,
+        error: Option<String>,
+    },
+    ModeSwitchResult {
+        mode: Mode,
+        error: Option<String>,
+    },
+    ConfigReloadResult {
+        error: Option<String>,
+    },
+    ConfigFetchResult {
+        error: Option<String>,
+    },
+    GeoUpdateResult {
+        error: Option<String>,
+    },
+    ConnectionCloseResult {
+        all: bool,
+        error: Option<String>,
+    },
     ApiResult {
         operation: ApiOperation,
         result: String,
@@ -123,6 +146,37 @@ impl Display for UpdateEvent {
             UpdateEvent::Rules(x) => write!(f, "{:?}", x),
             UpdateEvent::Log(x) => write!(f, "{:?}", x),
             UpdateEvent::ProxyTestLatencyDone => write!(f, "Test latency done"),
+            UpdateEvent::ProxySelectionResult {
+                group,
+                proxy,
+                error,
+            } => match error {
+                Some(error) => write!(f, "Failed to switch {group} to {proxy}: {error}"),
+                None => write!(f, "Switched {group} to {proxy}"),
+            },
+            UpdateEvent::ModeSwitchResult { mode, error } => match error {
+                Some(error) => write!(f, "Failed to switch mode to {mode:?}: {error}"),
+                None => write!(f, "Switched mode to {mode:?}"),
+            },
+            UpdateEvent::ConfigReloadResult { error } => match error {
+                Some(error) => write!(f, "Failed to reload configs: {error}"),
+                None => write!(f, "Configs reloaded"),
+            },
+            UpdateEvent::ConfigFetchResult { error } => match error {
+                Some(error) => write!(f, "Failed to fetch configs: {error}"),
+                None => write!(f, "Configs fetched"),
+            },
+            UpdateEvent::GeoUpdateResult { error } => match error {
+                Some(error) => write!(f, "Failed to update geo databases: {error}"),
+                None => write!(f, "Geo database update started"),
+            },
+            UpdateEvent::ConnectionCloseResult { all, error } => {
+                let target = if *all { "all connections" } else { "connection" };
+                match error {
+                    Some(error) => write!(f, "Failed to close {target}: {error}"),
+                    None => write!(f, "Closed {target}"),
+                }
+            }
             UpdateEvent::ApiResult { operation, result } => {
                 write!(f, "{:?}: {}", operation, result)
             }

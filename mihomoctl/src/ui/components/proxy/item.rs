@@ -17,7 +17,7 @@ impl<'a> From<(&'a str, &'a Proxy)> for ProxyItem {
         Self {
             name: name.to_owned(),
             proxy_type: proxy.proxy_type,
-            history: proxy.history.get(0).cloned(),
+            history: proxy.latest_history().cloned(),
             udp: proxy.udp,
             now: proxy.now.as_ref().map(Into::into),
         }

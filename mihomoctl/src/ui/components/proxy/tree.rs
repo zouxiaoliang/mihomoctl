@@ -56,13 +56,26 @@ impl<'a> ProxyTree<'a> {
     }
 
     #[inline]
-    pub fn current_group(&self) -> &ProxyGroup {
+    pub fn current_group(&self) -> &ProxyGroup<'a> {
         &self.groups[self.cursor]
     }
 
     #[inline]
     pub fn is_testing(&self) -> bool {
         self.testing
+    }
+
+    /// Names of all testable (normal-typed) proxies across every group,
+    /// deduplicated while keeping their first-seen order.
+    pub fn unique_normal_members(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.groups
+            .iter()
+            .flat_map(|group| group.members())
+            .filter(|member| member.proxy_type().is_normal())
+            .filter(|member| seen.insert(member.name().to_owned()))
+            .map(|member| member.name().to_owned())
+            .collect()
     }
 
     #[inline]
@@ -143,6 +156,7 @@ impl<'a> ProxyTree<'a> {
             let mut left = vec![
                 FooterItem::span(Span::styled(" FREE ", style)),
                 FooterItem::span(Span::styled(" SPACE to expand ", style)),
+                FooterItem::span(Span::styled(" ENTER choose node ", style)),
                 if self.testing {
                     FooterItem::span(Span::styled(" Testing ", highlight.fg(Color::Green)))
                 } else {
@@ -150,6 +164,13 @@ impl<'a> ProxyTree<'a> {
                 },
                 FooterItem::spans(sort),
             ];
+
+            if !self.testing {
+                left.insert(
+                    3,
+                    FooterItem::span(Span::styled(" Shift-T Test All ", style)),
+                );
+            }
 
             if let Some(query) = &self.search_query {
                 left.push(FooterItem::span(Span::styled(" SEARCH ", highlight)));
@@ -176,7 +197,10 @@ impl<'a> ProxyTree<'a> {
             footer.push_left(FooterItem::span(Span::styled(" [^] ▲ ▼ Move ", style)));
 
             if current_group.proxy_type.is_selector() {
-                footer.push_left(FooterItem::span(Span::styled(" ▶ Select ", style)));
+                footer.push_left(FooterItem::span(Span::styled(
+                    " ENTER switch node ",
+                    style,
+                )));
             }
 
             footer.push_left(if self.testing {
@@ -184,6 +208,10 @@ impl<'a> ProxyTree<'a> {
             } else {
                 FooterItem::spans(help_footer("Test", style, highlight)).wrapped()
             });
+
+            if !self.testing {
+                footer.push_left(FooterItem::span(Span::styled(" Shift-T Test All ", style)));
+            }
 
             footer.push_left(tagged_footer("Sort", style, self.sort_method).into());
 
@@ -319,6 +347,26 @@ impl<'a> ProxyTree<'a> {
     }
 }
 
+/// Walk the `now` chain of a (possibly nested) group until a proxy with a
+/// latency history is found, guarding against selection cycles.
+fn resolve_history(
+    proxies: &Proxies,
+    name: &str,
+) -> Option<mihomoctl_core::model::History> {
+    let mut name = name;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(name) {
+            return None;
+        }
+        let proxy = proxies.get(name)?;
+        if let Some(history) = proxy.latest_history() {
+            return Some(history.clone());
+        }
+        name = proxy.now.as_deref()?;
+    }
+}
+
 impl<'a> From<Proxies> for ProxyTree<'a> {
     fn from(val: Proxies) -> Self {
         let mut ret = Self {
@@ -332,13 +380,18 @@ impl<'a> From<Proxies> for ProxyTree<'a> {
                 .expect("ProxyGroup should have member vec");
             let mut members = Vec::with_capacity(all.len());
             for x in all.iter() {
-                let member = (
+                let mut member: ProxyItem = (
                     x.as_str(),
                     val.get(x)
                         .to_owned()
                         .expect("Group member should be in all proxies"),
                 )
                     .into();
+                // Groups usually have no latency history of their own; show
+                // the latency of the node they currently resolve to instead.
+                if member.history.is_none() {
+                    member.history = resolve_history(&val, x);
+                }
                 members.push(member);
             }
 
@@ -499,7 +552,7 @@ impl<'a> MovableListManage for ProxyTree<'a> {
 mod tests {
     use std::marker::PhantomData;
 
-    use mihomoctl_core::model::{History, ProxyType};
+    use mihomoctl_core::model::{History, Proxy, ProxyType};
     use tui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
     use crate::components::{Consts, ProxyTreeWidget};
@@ -531,6 +584,136 @@ mod tests {
             current: None,
             cursor: 0,
             _life: PhantomData,
+        }
+    }
+
+    fn proxy(proxy_type: ProxyType, delays: &[u64], now: Option<&str>) -> Proxy {
+        Proxy {
+            proxy_type,
+            history: delays
+                .iter()
+                .map(|delay| History {
+                    time: Default::default(),
+                    delay: *delay,
+                })
+                .collect(),
+            udp: None,
+            all: None,
+            now: now.map(ToOwned::to_owned),
+        }
+    }
+
+    fn proxies(entries: Vec<(&str, Proxy)>) -> Proxies {
+        Proxies {
+            proxies: entries
+                .into_iter()
+                .map(|(name, proxy)| (name.to_owned(), proxy))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn unique_normal_members_dedupes_and_skips_groups() {
+        let tree = ProxyTree {
+            groups: vec![
+                group(
+                    "A",
+                    vec![
+                        item("x"),
+                        item("y"),
+                        item_with_type("Inner", ProxyType::Selector, None),
+                    ],
+                ),
+                group("B", vec![item("y"), item("z")]),
+            ],
+            ..ProxyTree::default()
+        };
+
+        assert_eq!(tree.unique_normal_members(), vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn proxy_item_shows_the_latest_latency_test() {
+        let mut all = proxies(vec![(
+            "node",
+            proxy(ProxyType::Vmess, &[500, 42], None),
+        )]);
+        all.proxies.insert(
+            "Group".to_owned(),
+            Proxy {
+                all: Some(vec!["node".to_owned()]),
+                ..proxy(ProxyType::Selector, &[], Some("node"))
+            },
+        );
+
+        let tree: ProxyTree = all.into();
+        assert_eq!(tree.groups[0].members[0].delay(), Some(42));
+    }
+
+    #[test]
+    fn nested_group_member_resolves_latency_through_now_chain() {
+        let mut all = proxies(vec![
+            ("node", proxy(ProxyType::Vmess, &[123], None)),
+            ("untested", proxy(ProxyType::Vmess, &[], None)),
+        ]);
+        all.proxies.insert(
+            "Inner".to_owned(),
+            Proxy {
+                all: Some(vec!["node".to_owned(), "untested".to_owned()]),
+                ..proxy(ProxyType::Selector, &[], Some("node"))
+            },
+        );
+        all.proxies.insert(
+            "Outer".to_owned(),
+            Proxy {
+                all: Some(vec!["Inner".to_owned(), "untested".to_owned()]),
+                ..proxy(ProxyType::Selector, &[], Some("Inner"))
+            },
+        );
+
+        let tree: ProxyTree = all.into();
+        let outer = tree
+            .groups
+            .iter()
+            .find(|group| group.name == "Outer")
+            .unwrap();
+        let inner_member = outer
+            .members
+            .iter()
+            .find(|member| member.name() == "Inner")
+            .unwrap();
+        // "Inner" has no history of its own: latency comes from "node"
+        assert_eq!(inner_member.delay(), Some(123));
+        // Untested normal nodes still show no latency
+        let untested = outer
+            .members
+            .iter()
+            .find(|member| member.name() == "untested")
+            .unwrap();
+        assert_eq!(untested.delay(), None);
+    }
+
+    #[test]
+    fn latency_resolution_survives_selection_cycles() {
+        let mut all = proxies(vec![]);
+        all.proxies.insert(
+            "A".to_owned(),
+            Proxy {
+                all: Some(vec!["B".to_owned()]),
+                ..proxy(ProxyType::Selector, &[], Some("B"))
+            },
+        );
+        all.proxies.insert(
+            "B".to_owned(),
+            Proxy {
+                all: Some(vec!["A".to_owned()]),
+                ..proxy(ProxyType::Selector, &[], Some("A"))
+            },
+        );
+
+        let tree: ProxyTree = all.into();
+        for group in &tree.groups {
+            assert_eq!(group.members[0].delay(), None);
         }
     }
 
@@ -633,5 +816,28 @@ mod tests {
 
         assert!(rendered.contains(Consts::PROXY_LATENCY_SIGN.trim()));
         assert!(!rendered.contains(Consts::NOT_PROXY_SIGN.trim()));
+    }
+
+    #[test]
+    fn enter_switches_to_the_selected_node_in_a_selector_group() {
+        let mut tree = ProxyTree {
+            groups: vec![group("GLOBAL", vec![item("node-a"), item("node-b")])],
+            expanded: true,
+            ..ProxyTree::default()
+        };
+        tree.groups[0].cursor = 1;
+
+        let action = tree.handle(ListEvent {
+            fast: false,
+            code: KeyCode::Enter,
+        });
+
+        assert_eq!(
+            action,
+            Some(Action::ApplySelection {
+                group: "GLOBAL".to_owned(),
+                proxy: "node-b".to_owned(),
+            })
+        );
     }
 }

@@ -27,7 +27,7 @@ impl<'a> Widget for Tabs<'a> {
             })
             .collect();
         let tabs = TuiTabs::new(titles)
-            .block(get_block("Mihomoctl"))
+            .block(get_block("Mihomoctl · Shift-H Help"))
             .highlight_style(
                 Style::default()
                     .fg(Color::White)

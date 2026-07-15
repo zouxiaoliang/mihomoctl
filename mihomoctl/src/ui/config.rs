@@ -3,7 +3,10 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use once_cell::sync::OnceCell;
 use smart_default::SmartDefault;
 
-use crate::interactive::{mihomoctl::model::Config as ConfigModel, Config, ConfigData};
+use crate::interactive::{
+    mihomoctl::model::{Config as ConfigModel, Mode},
+    Config, ConfigData,
+};
 
 // static CONFIG: OnceCell<RwLock<Config>> = OnceCell::new();
 static CONFIG: OnceCell<RwLock<Config>> = OnceCell::new();
@@ -92,5 +95,9 @@ impl ConfigState {
 
     pub fn update_clash(&mut self, config: ConfigModel) {
         self.clash = Some(config)
+    }
+
+    pub fn current_mode(&self) -> Option<Mode> {
+        self.clash.as_ref().map(|conf| conf.mode)
     }
 }

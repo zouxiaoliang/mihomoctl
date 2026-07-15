@@ -21,8 +21,7 @@ pub fn route(state: &TuiStates, area: Rect, f: &mut Frame<Backend>) {
         5 => f.render_widget(api::ApiPage::new(state), area),
         6 => f.render_widget(api::ApiPage::new(state), area),
         7 => f.render_widget(api::ApiPage::new(state), area),
-        8 => f.render_widget(config::ConfigPage::new(&state.config_state), area),
-        9 => f.render_widget(debug::DebugPage::new(state), area),
+        8 => f.render_widget(debug::DebugPage::new(state), area),
         _ => unreachable!(),
     };
 }

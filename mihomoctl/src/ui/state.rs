@@ -1,7 +1,10 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use mihomoctl_core::{
-    model::{ConnectionWithSpeed, Log, Rule, Traffic, Version},
+    model::{ConnectionWithSpeed, Log, Mode, Rule, Traffic, Version},
     serde_json::Value,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -11,12 +14,14 @@ use tui::{
     text::{Span, Spans},
 };
 
+use url::Url;
+
 use crate::{
-    interactive::{ConSort, ControllerKind, Noop, RuleSort},
+    interactive::{ConSort, ControllerKind, Noop, RuleSort, Server},
     ui::{
         api::{self, ApiListState},
         components::{MovableListManage, MovableListManager, MovableListState, ProxyTree},
-        TuiResult,
+        get_config, TuiResult,
     },
     Action, ConfigState, Event, InputEvent, UpdateEvent,
 };
@@ -27,10 +32,125 @@ pub(crate) type RuleListState<'a> = MovableListState<'a, Rule, RuleSort>;
 pub(crate) type DebugListState<'a> = MovableListState<'a, Event, Noop>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeSwitchPopup {
+    pub current: Mode,
+    pub index: usize,
+}
+
+impl ModeSwitchPopup {
+    pub const MODES: [Mode; 3] = [Mode::Rule, Mode::Global, Mode::Direct];
+
+    pub fn new(current: Mode) -> Self {
+        let index = Self::MODES
+            .iter()
+            .position(|mode| *mode == current)
+            .unwrap_or(0);
+        Self { current, index }
+    }
+
+    pub fn selected(&self) -> Mode {
+        Self::MODES[self.index]
+    }
+}
+
+/// A generic "press Enter to confirm" popup carrying the action to run
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmPopup {
+    pub title: String,
+    pub body: String,
+    pub action: Action,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiResultPopup {
     pub title: String,
     pub body: String,
     pub offset: crate::Coord,
+}
+
+/// Transient confirmation shown after e.g. a successful server switch.
+/// Dismissed by any key, or automatically after [`NoticePopup::TTL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticePopup {
+    pub title: String,
+    pub body: String,
+    pub created: Instant,
+}
+
+impl NoticePopup {
+    pub const TTL: Duration = Duration::from_secs(5);
+
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            created: Instant::now(),
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.created.elapsed() >= Self::TTL
+    }
+
+    pub fn remaining_secs(&self) -> u64 {
+        Self::TTL
+            .saturating_sub(self.created.elapsed())
+            .as_secs_f64()
+            .ceil() as u64
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerSwitchPopup {
+    pub servers: Vec<Server>,
+    pub active: Option<Url>,
+    pub index: usize,
+    pub mode: ServerPopupMode,
+    /// Transient feedback shown at the bottom of the popup
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ServerPopupMode {
+    #[default]
+    List,
+    ConfirmDelete,
+    Add(ServerForm),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerForm {
+    pub url: String,
+    pub secret: String,
+    pub kind: ControllerKind,
+    pub field: ServerFormField,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServerFormField {
+    #[default]
+    Url,
+    Secret,
+    Kind,
+}
+
+impl ServerFormField {
+    fn next(self) -> Self {
+        match self {
+            Self::Url => Self::Secret,
+            Self::Secret => Self::Kind,
+            Self::Kind => Self::Url,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Url => Self::Kind,
+            Self::Secret => Self::Url,
+            Self::Kind => Self::Secret,
+        }
+    }
 }
 
 #[derive(Debug, Clone, SmartDefault)]
@@ -67,6 +187,13 @@ pub struct TuiStates<'a> {
     #[default(_code = "api::default_api_state()")]
     pub api_state: ApiListState<'a>,
     pub api_result_popup: Option<ApiResultPopup>,
+    pub notice_popup: Option<NoticePopup>,
+    pub server_popup: Option<ServerSwitchPopup>,
+    pub mode_popup: Option<ModeSwitchPopup>,
+    pub confirm_popup: Option<ConfirmPopup>,
+    /// Scroll offset of the help popup; `Some` while help is shown
+    pub help_popup: Option<crate::Coord>,
+    pub switch_to_server: Option<Url>,
     pub config_state: ConfigState,
 }
 
@@ -94,7 +221,6 @@ impl<'a> TuiStates<'a> {
         "Core",
         "DNS",
         "APIs",
-        "Configs",
         "Debug",
     ];
 
@@ -108,6 +234,15 @@ impl<'a> TuiStates<'a> {
     }
 
     pub fn handle(&mut self, event: Event) -> TuiResult<Option<Action>> {
+        // Any event (updates included) is an occasion to expire the notice,
+        // so it fades out on its own without user interaction.
+        if self
+            .notice_popup
+            .as_ref()
+            .is_some_and(NoticePopup::is_expired)
+        {
+            self.notice_popup = None;
+        }
         self.all_events_recv += 1;
         if self.debug_state.len() >= 300 {
             self.drop_events(100);
@@ -119,7 +254,13 @@ impl<'a> TuiStates<'a> {
                 self.should_quit = true;
                 Ok(None)
             }
-            Event::Input(event) => self.handle_input(event),
+            Event::Input(event) => {
+                // A transient notice is dismissed by any key press
+                if self.notice_popup.take().is_some() {
+                    return Ok(None);
+                }
+                self.handle_input(event)
+            }
             Event::Update(update) => self.handle_update(update),
             _ => Ok(None),
         }
@@ -276,6 +417,101 @@ impl<'a> TuiStates<'a> {
             UpdateEvent::ProxyTestLatencyDone => {
                 self.proxy_tree.end_testing();
             }
+            UpdateEvent::ProxySelectionResult {
+                group,
+                proxy,
+                error,
+            } => match error {
+                Some(error) => {
+                    self.api_result_popup = Some(ApiResultPopup {
+                        title: "Switch Node Failed".to_owned(),
+                        body: format!("{group} → {proxy}\n\n{error}"),
+                        offset: Default::default(),
+                    });
+                }
+                None => {
+                    self.notice_popup = Some(NoticePopup::new(
+                        "Node Switched",
+                        format!("{group} → {proxy}"),
+                    ));
+                }
+            },
+            UpdateEvent::ModeSwitchResult { mode, error } => match error {
+                Some(error) => {
+                    self.api_result_popup = Some(ApiResultPopup {
+                        title: "Switch Mode Failed".to_owned(),
+                        body: format!("mode → {mode:?}\n\n{error}"),
+                        offset: Default::default(),
+                    });
+                }
+                None => {
+                    self.notice_popup =
+                        Some(NoticePopup::new("Mode Switched", format!("mode → {mode:?}")));
+                }
+            },
+            UpdateEvent::ConfigFetchResult { error } => match error {
+                Some(error) => {
+                    self.api_result_popup = Some(ApiResultPopup {
+                        title: "Fetch Configs Failed".to_owned(),
+                        body: error,
+                        offset: Default::default(),
+                    });
+                }
+                None => {
+                    self.notice_popup = Some(NoticePopup::new(
+                        "Configs Refreshed",
+                        "Fetched the latest configs from the server".to_owned(),
+                    ));
+                }
+            },
+            UpdateEvent::ConnectionCloseResult { all, error } => {
+                let target = if all { "All Connections" } else { "Connection" };
+                match error {
+                    Some(error) => {
+                        self.api_result_popup = Some(ApiResultPopup {
+                            title: format!("Close {target} Failed"),
+                            body: error,
+                            offset: Default::default(),
+                        });
+                    }
+                    None => {
+                        self.notice_popup = Some(NoticePopup::new(
+                            format!("{target} Closed"),
+                            "The server has dropped the connection(s)".to_owned(),
+                        ));
+                    }
+                }
+            }
+            UpdateEvent::GeoUpdateResult { error } => match error {
+                Some(error) => {
+                    self.api_result_popup = Some(ApiResultPopup {
+                        title: "Update Geo Failed".to_owned(),
+                        body: error,
+                        offset: Default::default(),
+                    });
+                }
+                None => {
+                    self.notice_popup = Some(NoticePopup::new(
+                        "Geo Update Started",
+                        "The server is downloading the geo databases".to_owned(),
+                    ));
+                }
+            },
+            UpdateEvent::ConfigReloadResult { error } => match error {
+                Some(error) => {
+                    self.api_result_popup = Some(ApiResultPopup {
+                        title: "Reload Configs Failed".to_owned(),
+                        body: error,
+                        offset: Default::default(),
+                    });
+                }
+                None => {
+                    self.notice_popup = Some(NoticePopup::new(
+                        "Configs Reloaded",
+                        "Reloaded from the config file on the server".to_owned(),
+                    ));
+                }
+            },
             UpdateEvent::ApiResult { operation, result } => {
                 let popup_body = result.clone();
                 api::update_result(&mut self.config_core_api_state, operation, result.clone());
@@ -308,6 +544,25 @@ impl<'a> TuiStates<'a> {
                 }
             }
             InputEvent::Esc => {
+                if self.help_popup.take().is_some() {
+                    return Ok(None);
+                }
+                if let Some(popup) = self.server_popup.as_mut() {
+                    // Esc backs out of a sub-mode first, then closes the popup
+                    if matches!(popup.mode, ServerPopupMode::List) {
+                        self.server_popup = None;
+                    } else {
+                        popup.mode = ServerPopupMode::List;
+                        popup.message = None;
+                    }
+                    return Ok(None);
+                }
+                if self.mode_popup.take().is_some() {
+                    return Ok(None);
+                }
+                if self.confirm_popup.take().is_some() {
+                    return Ok(None);
+                }
                 if self.api_result_popup.take().is_some() {
                     return Ok(None);
                 }
@@ -337,6 +592,23 @@ impl<'a> TuiStates<'a> {
                 }
             }
             InputEvent::List(list_event) => {
+                if self.help_popup.is_some() {
+                    self.handle_help_popup_scroll(list_event);
+                    return Ok(None);
+                }
+                if self.server_popup.is_some() {
+                    self.handle_server_popup_key(list_event);
+                    return Ok(None);
+                }
+                if self.mode_popup.is_some() {
+                    return Ok(self.handle_mode_popup_key(list_event));
+                }
+                if self.confirm_popup.is_some() {
+                    if list_event.code == KeyCode::Enter {
+                        return Ok(self.confirm_popup.take().map(|popup| popup.action));
+                    }
+                    return Ok(None);
+                }
                 if self.api_result_popup.is_some() {
                     self.handle_api_result_popup_scroll(list_event);
                     return Ok(None);
@@ -387,6 +659,16 @@ impl<'a> TuiStates<'a> {
                     return Ok(Some(Action::TestLatency { proxies }));
                 }
             }
+            InputEvent::TestLatencyAll => {
+                if self.title() == "Proxies" && !self.proxy_tree.is_testing() {
+                    let proxies = self.proxy_tree.unique_normal_members();
+                    if proxies.is_empty() {
+                        return Ok(None);
+                    }
+                    self.proxy_tree.start_testing();
+                    return Ok(Some(Action::TestLatency { proxies }));
+                }
+            }
             InputEvent::NextSort => {
                 if let Some(mut list) = self.active_list() {
                     list.next_sort();
@@ -400,6 +682,45 @@ impl<'a> TuiStates<'a> {
             InputEvent::Other(event) => return self.handle_key_event(event),
         }
         Ok(None)
+    }
+
+    fn handle_help_popup_scroll(&mut self, event: crate::ListEvent) {
+        let Some(offset) = self.help_popup.as_mut() else {
+            return;
+        };
+        let step = if event.fast { 8 } else { 1 };
+        match event.code {
+            KeyCode::Up => offset.y = offset.y.saturating_sub(step),
+            KeyCode::Down => offset.y = offset.y.saturating_add(step),
+            KeyCode::Left => offset.x = offset.x.saturating_sub(step * 4),
+            KeyCode::Right => offset.x = offset.x.saturating_add(step * 4),
+            _ => {}
+        }
+    }
+
+    fn handle_mode_popup_key(&mut self, event: crate::ListEvent) -> Option<Action> {
+        let popup = self.mode_popup.as_mut()?;
+        match event.code {
+            KeyCode::Up => {
+                popup.index = popup
+                    .index
+                    .checked_sub(1)
+                    .unwrap_or(ModeSwitchPopup::MODES.len() - 1);
+            }
+            KeyCode::Down => {
+                popup.index = (popup.index + 1) % ModeSwitchPopup::MODES.len();
+            }
+            KeyCode::Enter => {
+                let mode = popup.selected();
+                let current = popup.current;
+                self.mode_popup = None;
+                if mode != current {
+                    return Some(Action::SetMode { mode });
+                }
+            }
+            _ => {}
+        }
+        None
     }
 
     fn handle_api_result_popup_scroll(&mut self, event: crate::ListEvent) {
@@ -417,6 +738,25 @@ impl<'a> TuiStates<'a> {
     }
 
     fn handle_key_event(&mut self, event: KeyEvent) -> TuiResult<Option<Action>> {
+        if self.help_popup.is_some() {
+            // Shift-H toggles the help popup closed again
+            if event.code == KeyCode::Char('H') {
+                self.help_popup = None;
+            }
+            return Ok(None);
+        }
+        if self.server_popup.is_some() {
+            self.handle_server_popup_char(event);
+            return Ok(None);
+        }
+        if self.mode_popup.is_some() {
+            // Only arrows / Enter / Esc drive the mode popup
+            return Ok(None);
+        }
+        if self.confirm_popup.is_some() {
+            // Only Enter / Esc drive the confirm popup
+            return Ok(None);
+        }
         if self.api_result_popup.is_some() {
             return Ok(None);
         }
@@ -467,7 +807,7 @@ impl<'a> TuiStates<'a> {
                         api::clear_current_param(api_state);
                         return Ok(None);
                     }
-                    (KeyModifiers::NONE, KeyCode::Char(ch)) => {
+                    (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(ch)) => {
                         api::input_char(api_state, ch);
                         return Ok(None);
                     }
@@ -504,8 +844,17 @@ impl<'a> TuiStates<'a> {
             (KeyModifiers::NONE, KeyCode::Char('q' | 'x')) => {
                 self.should_quit = true;
             }
+            (_, KeyCode::Char('S')) => {
+                self.open_server_popup();
+            }
+            (_, KeyCode::Char('H')) => {
+                self.help_popup = Some(Default::default());
+            }
             (KeyModifiers::NONE, KeyCode::Char('t')) => {
                 return self.handle_input(InputEvent::TestLatency);
+            }
+            (_, KeyCode::Char('T')) => {
+                return self.handle_input(InputEvent::TestLatencyAll);
             }
             (KeyModifiers::NONE, KeyCode::Char(' ')) => {
                 return self.handle_input(InputEvent::ToggleHold);
@@ -528,6 +877,60 @@ impl<'a> TuiStates<'a> {
             (KeyModifiers::NONE, KeyCode::Char('s')) => {
                 return self.handle_input(InputEvent::NextSort);
             }
+            (KeyModifiers::NONE, KeyCode::Char('m')) if self.title() == "Status" => {
+                if let Some(mode) = self.config_state.current_mode() {
+                    self.mode_popup = Some(ModeSwitchPopup::new(mode));
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('r')) if self.title() == "Status" => {
+                return Ok(Some(Action::FetchConfigs));
+            }
+            (_, KeyCode::Char('R')) if self.title() == "Status" => {
+                return Ok(Some(Action::ReloadConfigs));
+            }
+            (KeyModifiers::NONE, KeyCode::Char('k')) if self.title() == "Conns" => {
+                let id = self
+                    .con_state
+                    .current_item_index()
+                    .and_then(|index| self.con_state.get(index))
+                    .map(|connection| connection.connection.id.clone());
+                match id {
+                    Some(id) => return Ok(Some(Action::CloseConnection { id })),
+                    None => {
+                        self.notice_popup = Some(NoticePopup::new(
+                            "No Connection Selected",
+                            "Hold the list with Space and move to a connection first"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+            (_, KeyCode::Char('K')) if self.title() == "Conns" => {
+                if self.con_state.is_empty() {
+                    self.notice_popup = Some(NoticePopup::new(
+                        "No Active Connections",
+                        "There is nothing to close".to_owned(),
+                    ));
+                } else {
+                    self.confirm_popup = Some(ConfirmPopup {
+                        title: "Close All Connections".to_owned(),
+                        body: format!(
+                            "Close all {} active connections?",
+                            self.con_state.len()
+                        ),
+                        action: Action::CloseAllConnections,
+                    });
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('g')) if self.title() == "Status" => {
+                // Immediate feedback: the server downloads the databases
+                // before answering, which can take a long while.
+                self.notice_popup = Some(NoticePopup::new(
+                    "Updating Geo",
+                    "Requested geo database update, this may take a while...".to_owned(),
+                ));
+                return Ok(Some(Action::UpdateGeo));
+            }
             (KeyModifiers::NONE, KeyCode::Char('p')) => match self.title() {
                 "Conns" => {
                     self.con_state.toggle_paused();
@@ -541,6 +944,188 @@ impl<'a> TuiStates<'a> {
         }
 
         Ok(None)
+    }
+
+    fn open_server_popup(&mut self) {
+        let config = get_config();
+        let servers = config.servers.clone();
+        let active = config.using.clone();
+        drop(config);
+        self.open_server_popup_with(servers, active);
+        if let Some(popup) = self.server_popup.as_mut() {
+            if popup.servers.is_empty() {
+                popup.message = Some("No servers configured, press a to add one".to_owned());
+            }
+        }
+    }
+
+    pub fn open_server_popup_with(&mut self, servers: Vec<Server>, active: Option<Url>) {
+        let index = active
+            .as_ref()
+            .and_then(|url| servers.iter().position(|server| &server.url == url))
+            .unwrap_or(0);
+        self.server_popup = Some(ServerSwitchPopup {
+            servers,
+            active,
+            index,
+            mode: ServerPopupMode::List,
+            message: None,
+        });
+    }
+
+    fn handle_server_popup_key(&mut self, event: crate::ListEvent) {
+        let Some(popup) = self.server_popup.as_mut() else {
+            return;
+        };
+        match &mut popup.mode {
+            ServerPopupMode::List => {
+                let len = popup.servers.len();
+                if len == 0 {
+                    return;
+                }
+                match event.code {
+                    KeyCode::Up => popup.index = (popup.index + len - 1) % len,
+                    KeyCode::Down => popup.index = (popup.index + 1) % len,
+                    KeyCode::Enter => {
+                        let popup = self.server_popup.take().expect("checked above");
+                        let server = &popup.servers[popup.index];
+                        // Re-selecting the active server is a no-op
+                        if popup.active.as_ref() != Some(&server.url) {
+                            self.switch_to_server = Some(server.url.clone());
+                            self.should_quit = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ServerPopupMode::ConfirmDelete => {
+                if event.code == KeyCode::Enter {
+                    Self::delete_selected_server(popup);
+                }
+            }
+            ServerPopupMode::Add(form) => match event.code {
+                KeyCode::Down => form.field = form.field.next(),
+                KeyCode::Up => form.field = form.field.prev(),
+                KeyCode::Left | KeyCode::Right if form.field == ServerFormField::Kind => {
+                    form.kind = match form.kind {
+                        ControllerKind::Mihomo => ControllerKind::Clash,
+                        ControllerKind::Clash => ControllerKind::Mihomo,
+                    };
+                }
+                KeyCode::Enter => Self::submit_server_form(popup),
+                _ => {}
+            },
+        }
+    }
+
+    fn handle_server_popup_char(&mut self, event: KeyEvent) {
+        let Some(popup) = self.server_popup.as_mut() else {
+            return;
+        };
+        match &mut popup.mode {
+            ServerPopupMode::List => match event.code {
+                KeyCode::Char('a') => {
+                    popup.message = None;
+                    popup.mode = ServerPopupMode::Add(ServerForm::default());
+                }
+                KeyCode::Char('d') => {
+                    if popup.servers.is_empty() {
+                        return;
+                    }
+                    let selected = &popup.servers[popup.index];
+                    if popup.active.as_ref() == Some(&selected.url) {
+                        popup.message =
+                            Some("Cannot delete the active server, switch away first".to_owned());
+                    } else {
+                        popup.message = None;
+                        popup.mode = ServerPopupMode::ConfirmDelete;
+                    }
+                }
+                _ => {}
+            },
+            ServerPopupMode::ConfirmDelete => {}
+            ServerPopupMode::Add(form) => {
+                let input = match form.field {
+                    ServerFormField::Url => Some(&mut form.url),
+                    ServerFormField::Secret => Some(&mut form.secret),
+                    ServerFormField::Kind => None,
+                };
+                match (event.modifiers, event.code) {
+                    (_, KeyCode::Tab) => form.field = form.field.next(),
+                    (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                        if let Some(input) = input {
+                            input.clear();
+                        }
+                    }
+                    (_, KeyCode::Backspace) => {
+                        if let Some(input) = input {
+                            input.pop();
+                        }
+                    }
+                    (_, KeyCode::Char(' ')) if form.field == ServerFormField::Kind => {
+                        form.kind = match form.kind {
+                            ControllerKind::Mihomo => ControllerKind::Clash,
+                            ControllerKind::Clash => ControllerKind::Mihomo,
+                        };
+                    }
+                    (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(ch)) => {
+                        if let Some(input) = input {
+                            input.push(ch);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn submit_server_form(popup: &mut ServerSwitchPopup) {
+        let ServerPopupMode::Add(form) = &mut popup.mode else {
+            return;
+        };
+        let url = match Url::parse(form.url.trim()) {
+            Ok(url) => url,
+            Err(e) => {
+                form.error = Some(format!("Invalid URL: {e}"));
+                form.field = ServerFormField::Url;
+                return;
+            }
+        };
+        if popup.servers.iter().any(|server| server.url == url) {
+            form.error = Some(format!("{url} is already configured"));
+            form.field = ServerFormField::Url;
+            return;
+        }
+        let server = Server {
+            url,
+            secret: match form.secret.trim() {
+                "" => None,
+                secret => Some(secret.to_owned()),
+            },
+            kind: form.kind,
+        };
+        if let Err(e) = commit_server_add(&server) {
+            form.error = Some(e);
+            return;
+        }
+        popup.message = Some(format!("Added {}", server.url));
+        popup.servers.push(server);
+        popup.mode = ServerPopupMode::List;
+    }
+
+    fn delete_selected_server(popup: &mut ServerSwitchPopup) {
+        let url = popup.servers[popup.index].url.clone();
+        if let Err(e) = commit_server_delete(&url) {
+            popup.message = Some(e);
+            popup.mode = ServerPopupMode::List;
+            return;
+        }
+        popup.servers.remove(popup.index);
+        if popup.index >= popup.servers.len() {
+            popup.index = popup.servers.len().saturating_sub(1);
+        }
+        popup.message = Some(format!("Removed {url}"));
+        popup.mode = ServerPopupMode::List;
     }
 
     fn pick_api_param(&mut self) -> bool {
@@ -590,6 +1175,22 @@ impl<'a> TuiStates<'a> {
     }
 }
 
+fn commit_server_add(server: &Server) -> Result<(), String> {
+    let mut config = crate::ui::get_config_mut();
+    config.servers.push(server.clone());
+    config
+        .write()
+        .map_err(|e| format!("Failed to save config: {e}"))
+}
+
+fn commit_server_delete(url: &Url) -> Result<(), String> {
+    let mut config = crate::ui::get_config_mut();
+    config.servers.retain(|server| &server.url != url);
+    config
+        .write()
+        .map_err(|e| format!("Failed to save config: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -626,6 +1227,328 @@ mod tests {
             log_type: Level::Info,
             payload: payload.to_owned(),
         }
+    }
+
+    #[test]
+    fn status_page_m_key_opens_mode_switcher_popup() {
+        use mihomoctl_core::model::Mode;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-mode-switch-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        assert_eq!(state.title(), "Status");
+
+        // Mode unknown yet: key press is a no-op
+        state.handle(key(KeyCode::Char('m'))).unwrap();
+        assert!(state.mode_popup.is_none());
+
+        let config: crate::mihomoctl::model::Config = mihomoctl_core::serde_json::from_str(
+            r#"{
+                "port": 7890, "socks-port": 7891, "redir-port": 0, "tproxy-port": 0,
+                "mixed-port": 7893, "allow-lan": false, "ipv6": false,
+                "mode": "rule", "log-level": "info", "bind-address": "*"
+            }"#,
+        )
+        .unwrap();
+        state
+            .handle(Event::Update(UpdateEvent::Config(config)))
+            .unwrap();
+
+        state.handle(key(KeyCode::Char('m'))).unwrap();
+        let popup = state.mode_popup.as_ref().expect("popup should open");
+        // Preselects the current mode
+        assert_eq!(popup.selected(), Mode::Rule);
+
+        // Selecting the current mode again closes without emitting an action
+        let action = state.handle(key(KeyCode::Enter)).unwrap();
+        assert_eq!(action, None);
+        assert!(state.mode_popup.is_none());
+
+        // Move to Global and apply
+        state.handle(key(KeyCode::Char('m'))).unwrap();
+        state.handle(key(KeyCode::Down)).unwrap();
+        let action = state.handle(key(KeyCode::Enter)).unwrap();
+        assert_eq!(action, Some(Action::SetMode { mode: Mode::Global }));
+        assert!(state.mode_popup.is_none());
+
+        // Esc closes without action
+        state.handle(key(KeyCode::Char('m'))).unwrap();
+        let action = state.handle(key(KeyCode::Esc)).unwrap();
+        assert_eq!(action, None);
+        assert!(state.mode_popup.is_none());
+    }
+
+    #[test]
+    fn status_page_r_keys_fetch_or_reload_configs() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-config-reload-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        assert_eq!(state.title(), "Status");
+
+        // r fetches the remote runtime configs
+        let action = state.handle(key(KeyCode::Char('r'))).unwrap();
+        assert_eq!(action, Some(Action::FetchConfigs));
+
+        // Shift-R asks mihomo to reload the config file from disk
+        let action = state
+            .handle(Event::from(KeyEvent::new(
+                KeyCode::Char('R'),
+                KeyModifiers::SHIFT,
+            )))
+            .unwrap();
+        assert_eq!(action, Some(Action::ReloadConfigs));
+
+        // Only active on the Status page
+        state.handle(key(KeyCode::Char('4'))).unwrap();
+        let action = state.handle(key(KeyCode::Char('r'))).unwrap();
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn status_page_g_key_requests_geo_update() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-geo-update-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        assert_eq!(state.title(), "Status");
+
+        let action = state.handle(key(KeyCode::Char('g'))).unwrap();
+        assert_eq!(action, Some(Action::UpdateGeo));
+        // Immediate feedback while the server downloads the databases
+        assert!(state.notice_popup.is_some());
+
+        // The pending notice absorbs the next key press
+        state.handle(key(KeyCode::Char('4'))).unwrap();
+        assert!(state.notice_popup.is_none());
+
+        // Only active on the Status page
+        state.handle(key(KeyCode::Char('4'))).unwrap();
+        let action = state.handle(key(KeyCode::Char('g'))).unwrap();
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn geo_update_result_shows_notice_or_error_popup() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-geo-popup-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state
+            .handle(Event::Update(UpdateEvent::GeoUpdateResult { error: None }))
+            .unwrap();
+        assert!(state.notice_popup.is_some());
+
+        state
+            .handle(Event::Update(UpdateEvent::GeoUpdateResult {
+                error: Some("download failed".to_owned()),
+            }))
+            .unwrap();
+        assert!(state.api_result_popup.is_some());
+    }
+
+    fn connection_fixture(id: &str) -> ConnectionWithSpeed {
+        let connection = mihomoctl_core::serde_json::from_value(
+            mihomoctl_core::serde_json::json!({
+                "id": id,
+                "upload": 0,
+                "download": 0,
+                "metadata": {
+                    "type": "HTTP",
+                    "sourceIP": "127.0.0.1",
+                    "sourcePort": "50000",
+                    "destinationIP": "1.1.1.1",
+                    "destinationPort": "443",
+                    "host": "example.com",
+                    "network": "tcp"
+                },
+                "rule": "Match",
+                "rulePayload": "",
+                "start": "2026-01-01T00:00:00Z",
+                "chains": ["DIRECT"]
+            }),
+        )
+        .unwrap();
+        ConnectionWithSpeed {
+            connection,
+            upload: None,
+            download: None,
+        }
+    }
+
+    #[test]
+    fn conns_page_k_key_closes_selected_connection() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-conn-kill-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        // Go to Conns page
+        state.handle(key(KeyCode::Char('4'))).unwrap();
+        assert_eq!(state.title(), "Conns");
+
+        // Empty list: no action, but a hint notice appears
+        let action = state.handle(key(KeyCode::Char('k'))).unwrap();
+        assert_eq!(action, None);
+        assert!(state.notice_popup.take().is_some());
+
+        let update = ConnectionsWithSpeed {
+            connections: vec![connection_fixture("conn-1"), connection_fixture("conn-2")],
+            upload_total: 0,
+            download_total: 0,
+        };
+        state
+            .handle(Event::Update(UpdateEvent::Connection(update)))
+            .unwrap();
+
+        let action = state.handle(key(KeyCode::Char('k'))).unwrap();
+        assert!(matches!(action, Some(Action::CloseConnection { .. })));
+    }
+
+    #[test]
+    fn conns_page_shift_k_asks_before_closing_all_connections() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-conn-kill-all-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state.handle(key(KeyCode::Char('4'))).unwrap();
+        assert_eq!(state.title(), "Conns");
+
+        // Empty list: hint only
+        state
+            .handle(Event::from(KeyEvent::new(
+                KeyCode::Char('K'),
+                KeyModifiers::SHIFT,
+            )))
+            .unwrap();
+        assert!(state.confirm_popup.is_none());
+        assert!(state.notice_popup.take().is_some());
+
+        let update = ConnectionsWithSpeed {
+            connections: vec![connection_fixture("conn-1")],
+            upload_total: 0,
+            download_total: 0,
+        };
+        state
+            .handle(Event::Update(UpdateEvent::Connection(update)))
+            .unwrap();
+
+        // Shift-K opens the confirm popup
+        state
+            .handle(Event::from(KeyEvent::new(
+                KeyCode::Char('K'),
+                KeyModifiers::SHIFT,
+            )))
+            .unwrap();
+        assert!(state.confirm_popup.is_some());
+
+        // Esc cancels
+        let action = state.handle(key(KeyCode::Esc)).unwrap();
+        assert_eq!(action, None);
+        assert!(state.confirm_popup.is_none());
+
+        // Open again and confirm with Enter
+        state
+            .handle(Event::from(KeyEvent::new(
+                KeyCode::Char('K'),
+                KeyModifiers::SHIFT,
+            )))
+            .unwrap();
+        let action = state.handle(key(KeyCode::Enter)).unwrap();
+        assert_eq!(action, Some(Action::CloseAllConnections));
+        assert!(state.confirm_popup.is_none());
+    }
+
+    #[test]
+    fn connection_close_result_shows_notice_or_error_popup() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-conn-popup-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state
+            .handle(Event::Update(UpdateEvent::ConnectionCloseResult {
+                all: false,
+                error: None,
+            }))
+            .unwrap();
+        assert!(state.notice_popup.take().is_some());
+
+        state
+            .handle(Event::Update(UpdateEvent::ConnectionCloseResult {
+                all: true,
+                error: Some("connection not found".to_owned()),
+            }))
+            .unwrap();
+        assert!(state.api_result_popup.is_some());
+    }
+
+    #[test]
+    fn config_fetch_result_shows_notice_or_error_popup() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-fetch-popup-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state
+            .handle(Event::Update(UpdateEvent::ConfigFetchResult {
+                error: None,
+            }))
+            .unwrap();
+        assert!(state.notice_popup.is_some());
+
+        state
+            .handle(Event::Update(UpdateEvent::ConfigFetchResult {
+                error: Some("connection refused".to_owned()),
+            }))
+            .unwrap();
+        assert!(state.api_result_popup.is_some());
+    }
+
+    #[test]
+    fn config_reload_result_shows_notice_or_error_popup() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-reload-popup-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state
+            .handle(Event::Update(UpdateEvent::ConfigReloadResult {
+                error: None,
+            }))
+            .unwrap();
+        assert!(state.notice_popup.is_some());
+        assert!(state.api_result_popup.is_none());
+
+        state
+            .handle(Event::Update(UpdateEvent::ConfigReloadResult {
+                error: Some("config file not found".to_owned()),
+            }))
+            .unwrap();
+        assert!(state.api_result_popup.is_some());
+    }
+
+    #[test]
+    fn mode_switcher_selection_wraps_around() {
+        use mihomoctl_core::model::Mode;
+
+        use super::ModeSwitchPopup;
+
+        let mut popup = ModeSwitchPopup::new(Mode::Rule);
+        assert_eq!(popup.index, 0);
+
+        popup.index = ModeSwitchPopup::MODES.len() - 1;
+        assert_eq!(popup.selected(), Mode::Direct);
+    }
+
+    #[test]
+    fn mode_switch_result_shows_notice_or_error_popup() {
+        use mihomoctl_core::model::Mode;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-mode-popup-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state
+            .handle(Event::Update(UpdateEvent::ModeSwitchResult {
+                mode: Mode::Global,
+                error: None,
+            }))
+            .unwrap();
+        assert!(state.notice_popup.is_some());
+        assert!(state.api_result_popup.is_none());
+
+        state
+            .handle(Event::Update(UpdateEvent::ModeSwitchResult {
+                mode: Mode::Direct,
+                error: Some("connection refused".to_owned()),
+            }))
+            .unwrap();
+        assert!(state.api_result_popup.is_some());
     }
 
     #[test]
@@ -675,6 +1598,7 @@ mod tests {
         assert!(TuiStates::TITLES.contains(&"Core"));
         assert!(!TuiStates::TITLES.contains(&"DNS/Storage/Debug"));
         assert!(TuiStates::TITLES.contains(&"DNS"));
+        assert!(!TuiStates::TITLES.contains(&"Configs"));
 
         let mut state = TuiStates::default();
         state.page_index = 5;
@@ -905,13 +1829,13 @@ mod tests {
         for _ in 0..3 {
             state.handle(key(KeyCode::Char(']'))).unwrap();
         }
-        assert_eq!(state.title(), "Configs");
-
-        state.handle(key(KeyCode::Char(']'))).unwrap();
         assert_eq!(state.title(), "Status");
 
+        state.handle(key(KeyCode::Char(']'))).unwrap();
+        assert_eq!(state.title(), "Proxies");
+
         state.handle(key(KeyCode::Char('['))).unwrap();
-        assert_eq!(state.title(), "Configs");
+        assert_eq!(state.title(), "Status");
     }
 
     #[test]
@@ -997,6 +1921,358 @@ mod tests {
         assert_eq!(state.con_size, (50, 60));
     }
 
+    fn test_servers() -> Vec<crate::interactive::Server> {
+        use crate::interactive::Server;
+        vec![
+            Server {
+                url: url::Url::parse("http://127.0.0.1:9090/").unwrap(),
+                secret: None,
+                kind: ControllerKind::Mihomo,
+            },
+            Server {
+                url: url::Url::parse("http://10.0.0.2:9090/").unwrap(),
+                secret: None,
+                kind: ControllerKind::Clash,
+            },
+        ]
+    }
+
+    #[test]
+    fn server_popup_starts_on_active_server_and_esc_closes_it() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-popup-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let servers = test_servers();
+        let active = Some(servers[1].url.clone());
+
+        state.open_server_popup_with(servers, active);
+        assert_eq!(state.server_popup.as_ref().unwrap().index, 1);
+
+        state.handle(key(KeyCode::Esc)).unwrap();
+        assert!(state.server_popup.is_none());
+        assert!(state.switch_to_server.is_none());
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn server_popup_enter_requests_switch_to_selected_server() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-switch-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let servers = test_servers();
+        let expected = servers[1].url.clone();
+
+        state.open_server_popup_with(servers, Some("http://127.0.0.1:9090/".parse().unwrap()));
+        state.handle(key(KeyCode::Down)).unwrap();
+        state.handle(key(KeyCode::Enter)).unwrap();
+
+        assert!(state.server_popup.is_none());
+        assert_eq!(state.switch_to_server, Some(expected));
+        assert!(state.should_quit);
+    }
+
+    #[test]
+    fn server_popup_enter_on_active_server_is_noop() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-noop-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let servers = test_servers();
+        let active = Some(servers[0].url.clone());
+
+        state.open_server_popup_with(servers, active);
+        state.handle(key(KeyCode::Enter)).unwrap();
+
+        assert!(state.server_popup.is_none());
+        assert!(state.switch_to_server.is_none());
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn server_popup_navigation_wraps_and_blocks_other_keys() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-nav-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state.open_server_popup_with(test_servers(), None);
+        assert_eq!(state.server_popup.as_ref().unwrap().index, 0);
+
+        state.handle(key(KeyCode::Up)).unwrap();
+        assert_eq!(state.server_popup.as_ref().unwrap().index, 1);
+
+        state.handle(key(KeyCode::Down)).unwrap();
+        assert_eq!(state.server_popup.as_ref().unwrap().index, 0);
+
+        // Page shortcuts are ignored while the popup is open
+        state.handle(key(KeyCode::Char('3'))).unwrap();
+        assert_eq!(state.page_index, 0);
+    }
+
+    #[test]
+    fn shift_t_tests_all_unique_normal_nodes_across_groups() {
+        use std::collections::HashMap;
+
+        use crate::mihomoctl::model::{Proxies, Proxy, ProxyType};
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-test-all-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        state.page_index = 1; // Proxies page
+
+        let proxy = |proxy_type: ProxyType, all: Option<Vec<&str>>, now: Option<&str>| Proxy {
+            proxy_type,
+            history: vec![],
+            udp: None,
+            all: all.map(|x| x.into_iter().map(ToOwned::to_owned).collect()),
+            now: now.map(ToOwned::to_owned),
+        };
+        let mut map = HashMap::new();
+        map.insert("a".to_owned(), proxy(ProxyType::Vmess, None, None));
+        map.insert("b".to_owned(), proxy(ProxyType::Trojan, None, None));
+        map.insert(
+            "G1".to_owned(),
+            proxy(ProxyType::Selector, Some(vec!["a", "b"]), Some("a")),
+        );
+        map.insert(
+            "G2".to_owned(),
+            proxy(ProxyType::Selector, Some(vec!["b", "G1"]), Some("b")),
+        );
+        state
+            .handle(Event::Update(UpdateEvent::Proxies(Proxies {
+                proxies: map,
+            })))
+            .unwrap();
+
+        let shift_t = || Event::from(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        let action = state.handle(shift_t()).unwrap();
+        let Some(Action::TestLatency { mut proxies }) = action else {
+            panic!("expected TestLatency action, got {action:?}");
+        };
+        proxies.sort();
+        // Every normal node exactly once; nested groups are not tested directly
+        assert_eq!(proxies, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(state.proxy_tree.is_testing());
+
+        // No double-trigger while a test is already running
+        assert_eq!(state.handle(shift_t()).unwrap(), None);
+    }
+
+    #[test]
+    fn shift_h_toggles_scrollable_help_popup() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-help-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let shift_h = || Event::from(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+
+        state.handle(shift_h()).unwrap();
+        assert!(state.help_popup.is_some());
+
+        state.handle(key(KeyCode::Down)).unwrap();
+        assert_eq!(state.help_popup.as_ref().unwrap().y, 1);
+
+        // Other keys are swallowed while help is open ('q' does not quit)
+        state.handle(key(KeyCode::Char('q'))).unwrap();
+        assert!(!state.should_quit);
+        assert!(state.help_popup.is_some());
+
+        state.handle(shift_h()).unwrap();
+        assert!(state.help_popup.is_none());
+
+        state.handle(shift_h()).unwrap();
+        state.handle(key(KeyCode::Esc)).unwrap();
+        assert!(state.help_popup.is_none());
+    }
+
+    #[test]
+    fn notice_popup_closes_on_any_key_without_side_effects() {
+        use super::NoticePopup;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-notice-key-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        state.notice_popup = Some(NoticePopup::new("Server Switched", "Switched"));
+
+        // 'q' only dismisses the notice instead of quitting
+        state.handle(key(KeyCode::Char('q'))).unwrap();
+        assert!(state.notice_popup.is_none());
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn notice_popup_expires_on_background_updates() {
+        use std::time::{Duration, Instant};
+
+        use super::NoticePopup;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-notice-ttl-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let mut notice = NoticePopup::new("Server Switched", "Switched");
+        notice.created = Instant::now() - NoticePopup::TTL - Duration::from_secs(1);
+        state.notice_popup = Some(notice);
+
+        state
+            .handle(Event::Update(UpdateEvent::Connection(connections(1, 2))))
+            .unwrap();
+
+        assert!(state.notice_popup.is_none());
+    }
+
+    #[test]
+    fn server_popup_supports_adding_from_an_empty_list() {
+        use super::ServerPopupMode;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-empty-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state.open_server_popup_with(Vec::new(), None);
+        let popup = state.server_popup.as_ref().unwrap();
+        assert!(popup.servers.is_empty());
+
+        // Navigation and delete are no-ops on an empty list
+        state.handle(key(KeyCode::Down)).unwrap();
+        state.handle(key(KeyCode::Char('d'))).unwrap();
+        state.handle(key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            state.server_popup.as_ref().unwrap().mode,
+            ServerPopupMode::List
+        ));
+        assert!(!state.should_quit);
+
+        // Adding works right away
+        state.handle(key(KeyCode::Char('a'))).unwrap();
+        for ch in "http://10.1.1.1:9090/".chars() {
+            state.handle(key(KeyCode::Char(ch))).unwrap();
+        }
+        state.handle(key(KeyCode::Enter)).unwrap();
+
+        let popup = state.server_popup.as_ref().unwrap();
+        assert_eq!(popup.servers.len(), 1);
+        assert_eq!(popup.servers[0].url.as_str(), "http://10.1.1.1:9090/");
+    }
+
+    #[test]
+    fn server_popup_add_form_saves_new_server() {
+        use super::{ServerFormField, ServerPopupMode};
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-add-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        state.open_server_popup_with(test_servers(), None);
+
+        state.handle(key(KeyCode::Char('a'))).unwrap();
+        assert!(matches!(
+            state.server_popup.as_ref().unwrap().mode,
+            ServerPopupMode::Add(_)
+        ));
+
+        for ch in "http://192.168.1.5:9090/".chars() {
+            state.handle(key(KeyCode::Char(ch))).unwrap();
+        }
+        state.handle(key(KeyCode::Tab)).unwrap();
+        for ch in "token".chars() {
+            state.handle(key(KeyCode::Char(ch))).unwrap();
+        }
+        state.handle(key(KeyCode::Down)).unwrap(); // to kind field
+        state.handle(key(KeyCode::Right)).unwrap(); // mihomo -> clash
+        {
+            let popup = state.server_popup.as_ref().unwrap();
+            let ServerPopupMode::Add(form) = &popup.mode else {
+                panic!("expected add mode");
+            };
+            assert_eq!(form.field, ServerFormField::Kind);
+            assert_eq!(form.kind, ControllerKind::Clash);
+        }
+
+        state.handle(key(KeyCode::Enter)).unwrap();
+
+        let popup = state.server_popup.as_ref().unwrap();
+        assert!(matches!(popup.mode, ServerPopupMode::List));
+        let added = popup.servers.last().unwrap();
+        assert_eq!(added.url.as_str(), "http://192.168.1.5:9090/");
+        assert_eq!(added.secret.as_deref(), Some("token"));
+        assert_eq!(added.kind, ControllerKind::Clash);
+        assert!(popup.message.as_ref().unwrap().contains("Added"));
+    }
+
+    #[test]
+    fn server_popup_add_form_rejects_invalid_and_duplicate_urls() {
+        use super::ServerPopupMode;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-invalid-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        state.open_server_popup_with(test_servers(), None);
+        state.handle(key(KeyCode::Char('a'))).unwrap();
+
+        for ch in "not a url".chars() {
+            state.handle(key(KeyCode::Char(ch))).unwrap();
+        }
+        state.handle(key(KeyCode::Enter)).unwrap();
+        {
+            let popup = state.server_popup.as_ref().unwrap();
+            let ServerPopupMode::Add(form) = &popup.mode else {
+                panic!("expected add mode");
+            };
+            assert!(form.error.as_ref().unwrap().contains("Invalid URL"));
+        }
+
+        state.handle(ctrl_key(KeyCode::Char('u'))).unwrap();
+        for ch in "http://127.0.0.1:9090/".chars() {
+            state.handle(key(KeyCode::Char(ch))).unwrap();
+        }
+        state.handle(key(KeyCode::Enter)).unwrap();
+        {
+            let popup = state.server_popup.as_ref().unwrap();
+            let ServerPopupMode::Add(form) = &popup.mode else {
+                panic!("expected add mode");
+            };
+            assert!(form.error.as_ref().unwrap().contains("already configured"));
+        }
+
+        // Esc backs out to the list instead of closing the popup
+        state.handle(key(KeyCode::Esc)).unwrap();
+        let popup = state.server_popup.as_ref().unwrap();
+        assert!(matches!(popup.mode, ServerPopupMode::List));
+        assert_eq!(popup.servers.len(), 2);
+
+        state.handle(key(KeyCode::Esc)).unwrap();
+        assert!(state.server_popup.is_none());
+    }
+
+    #[test]
+    fn server_popup_deletes_inactive_server_after_confirmation() {
+        use super::ServerPopupMode;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-del-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let servers = test_servers();
+        let active = Some(servers[0].url.clone());
+        state.open_server_popup_with(servers, active);
+
+        state.handle(key(KeyCode::Down)).unwrap();
+        state.handle(key(KeyCode::Char('d'))).unwrap();
+        assert!(matches!(
+            state.server_popup.as_ref().unwrap().mode,
+            ServerPopupMode::ConfirmDelete
+        ));
+
+        state.handle(key(KeyCode::Enter)).unwrap();
+
+        let popup = state.server_popup.as_ref().unwrap();
+        assert!(matches!(popup.mode, ServerPopupMode::List));
+        assert_eq!(popup.servers.len(), 1);
+        assert_eq!(popup.servers[0].url.as_str(), "http://127.0.0.1:9090/");
+        assert!(popup.message.as_ref().unwrap().contains("Removed"));
+    }
+
+    #[test]
+    fn server_popup_refuses_to_delete_the_active_server() {
+        use super::ServerPopupMode;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-del-active-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let servers = test_servers();
+        let active = Some(servers[0].url.clone());
+        state.open_server_popup_with(servers, active);
+
+        state.handle(key(KeyCode::Char('d'))).unwrap();
+
+        let popup = state.server_popup.as_ref().unwrap();
+        assert!(matches!(popup.mode, ServerPopupMode::List));
+        assert_eq!(popup.servers.len(), 2);
+        assert!(popup.message.as_ref().unwrap().contains("active"));
+    }
+
     #[test]
     fn p_pauses_and_resumes_log_updates() {
         let _ = init_config(Config::from_dir("/tmp/mihomoctl-logs-pause-test.ron").unwrap());
@@ -1024,5 +2300,41 @@ mod tests {
             .unwrap();
         assert_eq!(state.log_state.len(), 2);
         assert_eq!(state.log_state[1].payload, "third");
+    }
+
+    #[test]
+    fn successful_node_switch_shows_confirmation() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-node-switch-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state
+            .handle(Event::Update(UpdateEvent::ProxySelectionResult {
+                group: "GLOBAL".to_owned(),
+                proxy: "node-a".to_owned(),
+                error: None,
+            }))
+            .unwrap();
+
+        let notice = state.notice_popup.as_ref().unwrap();
+        assert_eq!(notice.title, "Node Switched");
+        assert!(notice.body.contains("GLOBAL → node-a"));
+    }
+
+    #[test]
+    fn failed_node_switch_shows_error_details() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-node-switch-error-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        state
+            .handle(Event::Update(UpdateEvent::ProxySelectionResult {
+                group: "GLOBAL".to_owned(),
+                proxy: "node-a".to_owned(),
+                error: Some("authentication failed".to_owned()),
+            }))
+            .unwrap();
+
+        let popup = state.api_result_popup.as_ref().unwrap();
+        assert_eq!(popup.title, "Switch Node Failed");
+        assert!(popup.body.contains("authentication failed"));
     }
 }

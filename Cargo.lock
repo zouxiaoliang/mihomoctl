@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "mihomoctl"
-version = "0.3.3"
+version = "0.1.1"
 dependencies = [
  "bytesize",
  "chrono",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "mihomoctl-core"
-version = "0.4.2"
+version = "0.1.1"
 dependencies = [
  "cfg-if",
  "chrono",

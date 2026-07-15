@@ -674,7 +674,7 @@ impl ApiOperation {
                 params.config_path.as_str(),
             )),
             PatchConfigs => match parse_json(&params.config_patch_json) {
-                Ok(value) => json_result(clash.patch_configs(value)),
+                Ok(value) => unit_result(clash.patch_configs(value)),
                 Err(err) => err,
             },
             UpdateGeo => unit_result(clash.update_geo(
