@@ -113,6 +113,33 @@ where
         self.apply_search();
     }
 
+    /// Push a new item while retaining at most `cap` items, discarding the
+    /// oldest ones when the limit is exceeded. Used for unbounded streaming
+    /// lists (e.g. logs) to prevent memory from growing indefinitely.
+    pub fn push_capped(&mut self, item: T, cap: usize) {
+        self.items.push(item);
+        if self.offset.hold {
+            self.offset.y += 1;
+        }
+        if cap > 0 && self.items.len() > cap {
+            let overflow = self.items.len() - cap;
+            self.items.drain(..overflow);
+            // `offset.y` counts rows from the newest end, so trimming the
+            // oldest items leaves it valid; clamp only as a safety net.
+            self.offset.y = self.offset.y.min(self.items.len().saturating_sub(1));
+        }
+        self.apply_search();
+    }
+
+    /// Remove every item and reset the scroll/search view to a clean state.
+    /// Used by the "clear" action on streaming pages (Logs, Conns).
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.offset = Coord::default();
+        self.window_start.set(0);
+        self.apply_search();
+    }
+
     pub fn sort_label(&self) -> String
     where
         S: ToString,

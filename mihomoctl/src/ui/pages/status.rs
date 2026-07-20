@@ -29,13 +29,9 @@ impl<'a> Widget for StatusPage<'a> {
             time if time.elapsed().as_secs() == 0 => ("?".to_string(), "?".to_string()),
             time => {
                 let elapsed = time.elapsed().as_secs();
-                let (up_all, down_all) = self
-                    .state
-                    .traffics
-                    .iter()
-                    .fold((0, 0), |(up, down), traffic| {
-                        (up + traffic.up, down + traffic.down)
-                    });
+                // Use the cumulative total (not `traffics`, which is trimmed) so
+                // the average stays correct over long sessions.
+                let (up_all, down_all) = self.state.traffic_total;
 
                 (
                     ByteSize(up_all / elapsed).to_string_as(true) + "/s",

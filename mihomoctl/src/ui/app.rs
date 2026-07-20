@@ -382,6 +382,7 @@ Proxies
 Rules / Conns / Logs
   /           Search
   p           Pause updates (Conns, Logs)
+  c           Clear the list (Conns, Logs)
 
 Conns
   k           Close the selected connection

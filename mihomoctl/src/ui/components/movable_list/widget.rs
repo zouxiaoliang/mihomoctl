@@ -69,6 +69,7 @@ where
                 } else {
                     footer.push_left(FooterItem::span(Span::styled(" p Pause ", style)));
                 }
+                footer.push_left(FooterItem::span(Span::styled(" c Clear ", style)));
             }
             if !sort_str.is_empty() {
                 footer.push_left(tagged_footer("Sort", style, sort_str).into());
@@ -94,6 +95,7 @@ where
                 } else {
                     footer.push_left(FooterItem::span(Span::styled(" p Pause ", style)));
                 }
+                footer.push_left(FooterItem::span(Span::styled(" c Clear ", style)));
             }
             footer.push_left(FooterItem::span(Span::styled(
                 " SPACE / [^] ▲ ▼ ◀ ▶ Move ",

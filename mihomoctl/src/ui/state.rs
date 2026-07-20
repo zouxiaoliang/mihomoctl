@@ -31,6 +31,12 @@ pub(crate) type ConListState<'a> = MovableListState<'a, ConnectionWithSpeed, Con
 pub(crate) type RuleListState<'a> = MovableListState<'a, Rule, RuleSort>;
 pub(crate) type DebugListState<'a> = MovableListState<'a, Event, Noop>;
 
+/// Max traffic samples kept for the sparkline. Only the most recent samples are
+/// ever rendered, so older ones are discarded to bound memory growth.
+const TRAFFIC_HISTORY_CAP: usize = 600;
+/// Max log lines retained in the log view before the oldest are discarded.
+const LOG_HISTORY_CAP: usize = 2000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModeSwitchPopup {
     pub current: Mode,
@@ -160,6 +166,10 @@ pub struct TuiStates<'a> {
     pub start_time: Instant,
     pub version: Option<Version>,
     pub traffics: Vec<Traffic>,
+    // Cumulative (upload, download) over all traffic samples since start. Kept
+    // separately so the average-speed stat stays correct after `traffics` is
+    // trimmed to `TRAFFIC_HISTORY_CAP`.
+    pub traffic_total: (u64, u64),
     pub memory: Option<Value>,
     pub max_traffic: Traffic,
     pub all_events_recv: usize,
@@ -397,7 +407,15 @@ impl<'a> TuiStates<'a> {
                 let Traffic { up, down } = traffic;
                 self.max_traffic.up = self.max_traffic.up.max(up);
                 self.max_traffic.down = self.max_traffic.down.max(down);
-                self.traffics.push(traffic)
+                self.traffic_total.0 = self.traffic_total.0.saturating_add(up);
+                self.traffic_total.1 = self.traffic_total.1.saturating_add(down);
+                self.traffics.push(traffic);
+                // Keep only the most recent samples; the sparkline never reads
+                // further back, so this bounds memory over long sessions.
+                if self.traffics.len() > TRAFFIC_HISTORY_CAP {
+                    let overflow = self.traffics.len() - TRAFFIC_HISTORY_CAP;
+                    self.traffics.drain(..overflow);
+                }
             }
             UpdateEvent::Memory(memory) => self.memory = Some(memory),
             UpdateEvent::Proxies(proxies) => {
@@ -407,7 +425,7 @@ impl<'a> TuiStates<'a> {
             }
             UpdateEvent::Log(log) => {
                 if !self.log_state.is_paused() {
-                    self.log_state.push(log);
+                    self.log_state.push_capped(log, LOG_HISTORY_CAP);
                 }
             }
             UpdateEvent::Rules(rules) => {
@@ -937,6 +955,15 @@ impl<'a> TuiStates<'a> {
                 }
                 "Logs" => {
                     self.log_state.toggle_paused();
+                }
+                _ => {}
+            },
+            (KeyModifiers::NONE, KeyCode::Char('c')) => match self.title() {
+                "Conns" => {
+                    self.con_state.clear();
+                }
+                "Logs" => {
+                    self.log_state.clear();
                 }
                 _ => {}
             },
@@ -1855,6 +1882,71 @@ mod tests {
 
         assert!(state.debug_state.len() <= 300);
         assert_eq!(state.all_events_recv, 350);
+    }
+
+    #[test]
+    fn traffic_samples_are_capped_but_total_is_preserved() {
+        use crate::mihomoctl::model::Traffic;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-traffic-cap-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        let samples = super::TRAFFIC_HISTORY_CAP + 500;
+        for _ in 0..samples {
+            state
+                .handle(Event::Update(UpdateEvent::Traffic(Traffic {
+                    up: 3,
+                    down: 7,
+                })))
+                .unwrap();
+        }
+
+        // The sparkline buffer is bounded ...
+        assert!(state.traffics.len() <= super::TRAFFIC_HISTORY_CAP);
+        // ... but the cumulative total still accounts for every sample.
+        assert_eq!(state.traffic_total, (3 * samples as u64, 7 * samples as u64));
+    }
+
+    #[test]
+    fn log_lines_are_capped_when_limit_is_reached() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-log-cap-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        for i in 0..(super::LOG_HISTORY_CAP + 300) {
+            state
+                .handle(Event::Update(UpdateEvent::Log(Log {
+                    log_type: Level::Info,
+                    payload: format!("line {i}"),
+                })))
+                .unwrap();
+        }
+
+        assert!(state.log_state.len() <= super::LOG_HISTORY_CAP);
+    }
+
+    #[test]
+    fn clear_key_empties_the_log_list() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-log-clear-test.ron").unwrap());
+        let mut state = TuiStates::default();
+
+        for i in 0..5 {
+            state
+                .handle(Event::Update(UpdateEvent::Log(Log {
+                    log_type: Level::Info,
+                    payload: format!("line {i}"),
+                })))
+                .unwrap();
+        }
+        assert!(!state.log_state.is_empty());
+
+        state.page_index = TuiStates::TITLES
+            .iter()
+            .position(|title| *title == "Logs")
+            .expect("Logs page exists") as u8;
+        assert_eq!(state.title(), "Logs");
+
+        state.handle(key(KeyCode::Char('c'))).unwrap();
+        assert!(state.log_state.is_empty());
     }
 
     #[test]
