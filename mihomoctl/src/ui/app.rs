@@ -144,23 +144,17 @@ enum SessionNotice {
     Failure(String),
 }
 
-/// Verify the target server is reachable, then persist it as the active one.
-/// On failure the config is left untouched and a message for the user is
-/// returned instead.
-fn switch_server(flag: &Flags, url: &Url) -> Result<ControllerKind, String> {
+/// Persist the target server as the active one without touching the network.
+/// Connecting happens in the next session's background servo, so an
+/// unreachable server can never freeze the UI: the session simply comes up
+/// with a connection error popup and the user can switch away again.
+fn switch_server(_flag: &Flags, url: &Url) -> Result<ControllerKind, String> {
     let server = get_config()
         .servers
         .iter()
         .find(|server| &server.url == url)
         .cloned()
         .ok_or_else(|| format!("Server {url} is not in the config anymore"))?;
-
-    server
-        .clone()
-        .into_clash_with_timeout(Some(Duration::from_millis(flag.timeout)))
-        .map_err(|e| e.to_string())
-        .and_then(|clash| clash.get_version().map_err(|e| e.to_string()))
-        .map_err(|e| format!("Failed to connect to {url}: {e}\n\nStaying on the current server."))?;
 
     let mut config = get_config_mut();
     config.use_server(url.to_owned()).map_err(|e| e.to_string())?;
@@ -177,7 +171,12 @@ fn run_session(
     session_tx: &Arc<Mutex<Option<Sender<Event>>>>,
     notice: Option<SessionNotice>,
 ) -> TuiResult<SessionOutcome> {
+    let (event_tx, event_rx) = channel();
+    let (action_tx, action_rx) = channel();
+
     let mut initial_state = TuiStates::for_controller_kind(controller_kind);
+    // Server reachability probes report back through the event loop
+    initial_state.probe_tx = Some(event_tx.clone());
     match notice {
         Some(SessionNotice::Success(body)) => {
             initial_state.notice_popup = Some(NoticePopup::new("Server Switched", body));
@@ -213,9 +212,6 @@ fn run_session(
 
     let state = Arc::new(RwLock::new(initial_state));
     let error = Arc::new(Mutex::new(None));
-
-    let (event_tx, event_rx) = channel();
-    let (action_tx, action_rx) = channel();
 
     *session_tx.lock().unwrap() = Some(event_tx.clone());
 
@@ -391,6 +387,7 @@ Conns
 API pages (Core / DNS / APIs)
   Up / Down   Select operation
   Enter       Run operation (dangerous ones ask to confirm)
+              Core runs with default parameters directly
   i           Edit parameters
   Tab         Next parameter
   p           Pick parameter from current context
@@ -587,6 +584,8 @@ fn render_server_popup(state: &TuiStates, f: &mut Frame<Backend>) {
 }
 
 fn server_list_lines<'a>(popup: &'a crate::ui::ServerSwitchPopup) -> Vec<Spans<'a>> {
+    use crate::ui::ServerConnectivity;
+
     let mut lines = popup
         .servers
         .iter()
@@ -594,7 +593,7 @@ fn server_list_lines<'a>(popup: &'a crate::ui::ServerSwitchPopup) -> Vec<Spans<'
         .map(|(index, server)| {
             let is_active = popup.active.as_ref() == Some(&server.url);
             let marker = if is_active { "→ " } else { "  " };
-            let content = format!("{}{:<8}{}", marker, server.kind.as_str(), server.url);
+            let content = format!("{}{:<8}{:<40}", marker, server.kind.as_str(), server.url);
             let style = if index == popup.index {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else if is_active {
@@ -602,7 +601,21 @@ fn server_list_lines<'a>(popup: &'a crate::ui::ServerSwitchPopup) -> Vec<Spans<'
             } else {
                 Style::default().fg(Color::White)
             };
-            Spans::from(Span::styled(content, style))
+            let (status, status_color) = match popup.connectivity.get(&server.url) {
+                Some(ServerConnectivity::Checking) => ("… checking".to_owned(), Color::DarkGray),
+                Some(ServerConnectivity::Reachable { latency_ms }) => {
+                    (format!("✓ {latency_ms} ms"), Color::Green)
+                }
+                Some(ServerConnectivity::Unreachable(_)) => {
+                    ("✗ unreachable".to_owned(), Color::Red)
+                }
+                None => ("".to_owned(), Color::DarkGray),
+            };
+            Spans::from(vec![
+                Span::styled(content, style),
+                Span::raw(" "),
+                Span::styled(status, Style::default().fg(status_color)),
+            ])
         })
         .collect::<Vec<_>>();
     if popup.servers.is_empty() {

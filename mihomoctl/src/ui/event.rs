@@ -128,6 +128,11 @@ pub enum UpdateEvent {
         all: bool,
         error: Option<String>,
     },
+    ServerProbeResult {
+        url: url::Url,
+        latency_ms: Option<u64>,
+        error: Option<String>,
+    },
     ApiResult {
         operation: ApiOperation,
         result: String,
@@ -169,6 +174,15 @@ impl Display for UpdateEvent {
             UpdateEvent::GeoUpdateResult { error } => match error {
                 Some(error) => write!(f, "Failed to update geo databases: {error}"),
                 None => write!(f, "Geo database update started"),
+            },
+            UpdateEvent::ServerProbeResult {
+                url,
+                latency_ms,
+                error,
+            } => match (latency_ms, error) {
+                (Some(ms), _) => write!(f, "Server {url} reachable in {ms} ms"),
+                (None, Some(error)) => write!(f, "Server {url} unreachable: {error}"),
+                (None, None) => write!(f, "Server {url} probe finished"),
             },
             UpdateEvent::ConnectionCloseResult { all, error } => {
                 let target = if *all { "all connections" } else { "connection" };

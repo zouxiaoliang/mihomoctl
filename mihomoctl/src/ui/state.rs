@@ -114,6 +114,15 @@ pub struct ServerSwitchPopup {
     pub mode: ServerPopupMode,
     /// Transient feedback shown at the bottom of the popup
     pub message: Option<String>,
+    /// Probe results per server, filled in asynchronously after opening
+    pub connectivity: HashMap<Url, ServerConnectivity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerConnectivity {
+    Checking,
+    Reachable { latency_ms: u64 },
+    Unreachable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -205,6 +214,9 @@ pub struct TuiStates<'a> {
     pub help_popup: Option<crate::Coord>,
     pub switch_to_server: Option<Url>,
     pub config_state: ConfigState,
+    /// Sender used to deliver async server probe results back into the event
+    /// loop; set once per session by the app
+    pub probe_tx: Option<std::sync::mpsc::Sender<Event>>,
 }
 
 fn default_connection_state<'a>() -> ConListState<'a> {
@@ -482,6 +494,22 @@ impl<'a> TuiStates<'a> {
                     ));
                 }
             },
+            UpdateEvent::ServerProbeResult {
+                url,
+                latency_ms,
+                error,
+            } => {
+                if let Some(popup) = self.server_popup.as_mut() {
+                    let status = match (latency_ms, error) {
+                        (Some(latency_ms), _) => ServerConnectivity::Reachable { latency_ms },
+                        (None, Some(error)) => ServerConnectivity::Unreachable(error),
+                        (None, None) => {
+                            ServerConnectivity::Unreachable("unknown error".to_owned())
+                        }
+                    };
+                    popup.connectivity.insert(url, status);
+                }
+            }
             UpdateEvent::ConnectionCloseResult { all, error } => {
                 let target = if all { "All Connections" } else { "Connection" };
                 match error {
@@ -650,11 +678,14 @@ impl<'a> TuiStates<'a> {
                     }
                 }
                 if self.is_api_page() && list_event.code == KeyCode::Enter {
+                    // Core operations run with their default parameters right
+                    // away; params remain editable through `i` if needed.
+                    let run_with_defaults = self.title() == "Core";
                     let Some(api_state) = self.active_api_state_mut() else {
                         return Ok(None);
                     };
                     api_state.hold();
-                    if api::current_needs_input(api_state) {
+                    if !run_with_defaults && api::current_needs_input(api_state) {
                         api::begin_edit(api_state);
                         return Ok(None);
                     }
@@ -991,13 +1022,57 @@ impl<'a> TuiStates<'a> {
             .as_ref()
             .and_then(|url| servers.iter().position(|server| &server.url == url))
             .unwrap_or(0);
+        let connectivity = self.probe_servers(&servers);
         self.server_popup = Some(ServerSwitchPopup {
             servers,
             active,
             index,
             mode: ServerPopupMode::List,
             message: None,
+            connectivity,
         });
+    }
+
+    /// Kick off a background reachability probe for every server and return
+    /// their initial `Checking` states. Results come back through the event
+    /// loop as [`UpdateEvent::ServerProbeResult`], so the UI never blocks.
+    fn probe_servers(&self, servers: &[Server]) -> HashMap<Url, ServerConnectivity> {
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let Some(tx) = self.probe_tx.clone() else {
+            return HashMap::new();
+        };
+
+        for server in servers {
+            let server = server.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let result = server
+                    .clone()
+                    .into_clash_with_timeout(Some(PROBE_TIMEOUT))
+                    .map_err(|e| e.to_string())
+                    .and_then(|clash| clash.get_version().map_err(|e| e.to_string()));
+                let event = match result {
+                    Ok(_) => UpdateEvent::ServerProbeResult {
+                        url: server.url,
+                        latency_ms: Some(started.elapsed().as_millis() as u64),
+                        error: None,
+                    },
+                    Err(error) => UpdateEvent::ServerProbeResult {
+                        url: server.url,
+                        latency_ms: None,
+                        error: Some(error),
+                    },
+                };
+                let _ = tx.send(Event::Update(event));
+            });
+        }
+
+        servers
+            .iter()
+            .map(|server| (server.url.clone(), ServerConnectivity::Checking))
+            .collect()
     }
 
     fn handle_server_popup_key(&mut self, event: crate::ListEvent) {
@@ -1690,12 +1765,9 @@ mod tests {
             Some(ApiOperation::ReloadConfigs)
         );
 
+        // Core runs with defaults: no edit mode, straight to confirmation
         assert_eq!(state.handle(key(KeyCode::Enter)).unwrap(), None);
-        assert!(api::is_editing(state.active_api_state().unwrap()));
-        assert_eq!(
-            state.handle(key(KeyCode::Enter)).unwrap(),
-            None
-        );
+        assert!(!api::is_editing(state.active_api_state().unwrap()));
         assert!(
             api::current_result(state.active_api_state().unwrap())
                 .unwrap()
@@ -1727,6 +1799,51 @@ mod tests {
 
         state.handle(key(KeyCode::Esc)).unwrap();
         assert!(state.api_result_popup.is_none());
+    }
+
+    #[test]
+    fn core_page_enter_runs_operations_with_default_parameters() {
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-core-defaults-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        state.page_index = 5;
+        assert_eq!(state.title(), "Core");
+
+        // PatchConfigs is parameterized but not dangerous: a single Enter
+        // runs it with default params instead of opening the input box
+        state.handle(key(KeyCode::Down)).unwrap();
+        state.handle(key(KeyCode::Down)).unwrap();
+        assert_eq!(
+            api::current_operation(state.active_api_state().unwrap()),
+            Some(ApiOperation::PatchConfigs)
+        );
+
+        let action = state.handle(key(KeyCode::Enter)).unwrap();
+        assert!(!api::is_editing(state.active_api_state().unwrap()));
+        assert_eq!(
+            action,
+            Some(Action::InvokeApi {
+                operation: ApiOperation::PatchConfigs,
+                params: Default::default(),
+            })
+        );
+
+        // Dangerous parameterized operations still confirm with Enter twice
+        state.handle(key(KeyCode::Up)).unwrap();
+        assert_eq!(
+            api::current_operation(state.active_api_state().unwrap()),
+            Some(ApiOperation::ReloadConfigs)
+        );
+        let action = state.handle(key(KeyCode::Enter)).unwrap();
+        assert_eq!(action, None);
+        assert!(!api::is_editing(state.active_api_state().unwrap()));
+        let action = state.handle(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            action,
+            Some(Action::InvokeApi {
+                operation: ApiOperation::ReloadConfigs,
+                params: Default::default(),
+            })
+        );
     }
 
     #[test]
@@ -2027,6 +2144,93 @@ mod tests {
                 kind: ControllerKind::Clash,
             },
         ]
+    }
+
+    #[test]
+    fn server_popup_probes_connectivity_when_a_probe_channel_is_set() {
+        use std::sync::mpsc::channel;
+
+        use super::ServerConnectivity;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-server-probe-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let (tx, rx) = channel();
+        state.probe_tx = Some(tx);
+        let servers = test_servers();
+        let first = servers[0].url.clone();
+        let second = servers[1].url.clone();
+
+        state.open_server_popup_with(servers, Some(first.clone()));
+
+        // Both servers start out as Checking
+        let popup = state.server_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.connectivity.get(&first),
+            Some(&ServerConnectivity::Checking)
+        );
+        assert_eq!(
+            popup.connectivity.get(&second),
+            Some(&ServerConnectivity::Checking)
+        );
+
+        // Probe threads report back through the event channel (both targets
+        // are unreachable in tests, so results arrive within the timeout)
+        for _ in 0..2 {
+            let event = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("probe result should arrive");
+            state.handle(event).unwrap();
+        }
+
+        let popup = state.server_popup.as_ref().unwrap();
+        assert!(matches!(
+            popup.connectivity.get(&first),
+            Some(ServerConnectivity::Unreachable(_))
+        ));
+        assert!(matches!(
+            popup.connectivity.get(&second),
+            Some(ServerConnectivity::Unreachable(_))
+        ));
+    }
+
+    #[test]
+    fn server_probe_results_update_the_popup_connectivity() {
+        use super::ServerConnectivity;
+
+        let _ = init_config(Config::from_dir("/tmp/mihomoctl-probe-update-test.ron").unwrap());
+        let mut state = TuiStates::default();
+        let servers = test_servers();
+        let reachable = servers[0].url.clone();
+        let unreachable = servers[1].url.clone();
+
+        state.open_server_popup_with(servers, None);
+
+        state
+            .handle(Event::Update(UpdateEvent::ServerProbeResult {
+                url: reachable.clone(),
+                latency_ms: Some(12),
+                error: None,
+            }))
+            .unwrap();
+        state
+            .handle(Event::Update(UpdateEvent::ServerProbeResult {
+                url: unreachable.clone(),
+                latency_ms: None,
+                error: Some("connection refused".to_owned()),
+            }))
+            .unwrap();
+
+        let popup = state.server_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.connectivity.get(&reachable),
+            Some(&ServerConnectivity::Reachable { latency_ms: 12 })
+        );
+        assert_eq!(
+            popup.connectivity.get(&unreachable),
+            Some(&ServerConnectivity::Unreachable(
+                "connection refused".to_owned()
+            ))
+        );
     }
 
     #[test]

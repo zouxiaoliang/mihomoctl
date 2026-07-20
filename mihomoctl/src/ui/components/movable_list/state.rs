@@ -106,29 +106,42 @@ where
     }
 
     pub fn push(&mut self, item: T) {
-        self.items.push(item);
         if self.offset.hold {
             self.offset.y += 1;
         }
-        self.apply_search();
+        // Filter incrementally: only the new item is tested instead of
+        // rescanning the whole list, which keeps streaming pages cheap while a
+        // search is active.
+        self.push_filtered_index(&item);
+        self.items.push(item);
     }
 
     /// Push a new item while retaining at most `cap` items, discarding the
     /// oldest ones when the limit is exceeded. Used for unbounded streaming
     /// lists (e.g. logs) to prevent memory from growing indefinitely.
     pub fn push_capped(&mut self, item: T, cap: usize) {
-        self.items.push(item);
         if self.offset.hold {
             self.offset.y += 1;
         }
+        // Incremental filter update (see `push`): avoids an O(n) rescan per
+        // incoming line, which otherwise turns a stream into O(n²) work.
+        self.push_filtered_index(&item);
+        self.items.push(item);
         if cap > 0 && self.items.len() > cap {
             let overflow = self.items.len() - cap;
             self.items.drain(..overflow);
             // `offset.y` counts rows from the newest end, so trimming the
             // oldest items leaves it valid; clamp only as a safety net.
             self.offset.y = self.offset.y.min(self.items.len().saturating_sub(1));
+            // Drop trimmed items from the filter set and rebase the surviving
+            // indices onto the shrunk `items` vector.
+            if let Some(indices) = self.filtered_indices.as_mut() {
+                indices.retain(|&index| index >= overflow);
+                for index in indices.iter_mut() {
+                    *index -= overflow;
+                }
+            }
         }
-        self.apply_search();
     }
 
     /// Remove every item and reset the scroll/search view to a clean state.
@@ -252,6 +265,7 @@ where
         if let Some(query) = self.search_query.as_mut() {
             query.push(ch);
             self.apply_search();
+            self.reset_search_view();
         }
         self
     }
@@ -260,21 +274,47 @@ where
         if let Some(query) = self.search_query.as_mut() {
             query.pop();
             self.apply_search();
+            self.reset_search_view();
         }
         self
     }
 
+    /// Jump the view back to the top of the results. Called when the query
+    /// itself changes, not when the underlying items change — that keeps a
+    /// live stream from yanking the scroll position on every new item.
+    fn reset_search_view(&mut self) {
+        self.offset.x = 0;
+        self.offset.y = 0;
+        self.offset.hold = true;
+    }
+
+    /// Lowercased search text, or `None` when no active (non-empty) filter.
+    fn active_query(&self) -> Option<String> {
+        self.search_query
+            .as_ref()
+            .filter(|query| !query.is_empty())
+            .map(|query| query.to_lowercase())
+    }
+
+    /// Incrementally record whether a soon-to-be-appended item matches the
+    /// active filter. `item` is tested once and its index (its position once
+    /// pushed) added to `filtered_indices` on a match.
+    fn push_filtered_index(&mut self, item: &T) {
+        let Some(query) = self.active_query() else {
+            return;
+        };
+        let indices = self.filtered_indices.get_or_insert_with(Vec::new);
+        if item_search_text(item).to_lowercase().contains(&query) {
+            indices.push(self.items.len());
+        }
+    }
+
     fn apply_search(&mut self) -> &mut Self {
-        let Some(query) = self.search_query.as_ref() else {
+        let Some(query) = self.active_query() else {
             self.filtered_indices = None;
             return self;
         };
-        if query.is_empty() {
-            self.filtered_indices = None;
-            return self;
-        }
 
-        let query = query.to_lowercase();
         let filtered_indices = self
             .items
             .iter()
@@ -288,9 +328,6 @@ where
             .collect::<Vec<_>>();
 
         self.filtered_indices = Some(filtered_indices);
-        self.offset.x = 0;
-        self.offset.y = 0;
-        self.offset.hold = true;
         self
     }
 
@@ -686,6 +723,53 @@ mod tests {
         assert_eq!(state.search_query(), Some("needle"));
         assert_eq!(state.visible_len(), 2);
         assert_eq!(state.offset.y, 0);
+    }
+
+    #[test]
+    fn pushing_while_searching_updates_filter_incrementally() {
+        let mut state: MovableListState<'_, String, Noop> =
+            MovableListState::new(vec!["needle one".to_owned(), "other".to_owned()]);
+
+        state.begin_search();
+        for ch in "needle".chars() {
+            state.input_search_char(ch);
+        }
+        assert_eq!(state.visible_len(), 1);
+
+        // A matching and a non-matching item arrive on the stream.
+        state.push("needle two".to_owned());
+        state.push("noise".to_owned());
+
+        assert_eq!(state.visible_len(), 2);
+        // The full recompute must agree with the incremental updates.
+        state.apply_search();
+        assert_eq!(state.visible_len(), 2);
+    }
+
+    #[test]
+    fn capped_push_while_searching_rebases_filter_indices() {
+        let mut state: MovableListState<'_, String, Noop> = MovableListState::new(vec![]);
+
+        state.begin_search();
+        for ch in "needle".chars() {
+            state.input_search_char(ch);
+        }
+
+        // Overflow the cap so the oldest (matching) items get trimmed.
+        for i in 0..10 {
+            let text = if i % 2 == 0 {
+                format!("needle {i}")
+            } else {
+                format!("other {i}")
+            };
+            state.push_capped(text, 4);
+        }
+
+        assert_eq!(state.items.len(), 4);
+        // Incremental indices must still line up with a fresh full scan.
+        let incremental = state.visible_len();
+        state.apply_search();
+        assert_eq!(state.visible_len(), incremental);
     }
 
     #[test]
