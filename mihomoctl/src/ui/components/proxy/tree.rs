@@ -29,7 +29,44 @@ pub struct ProxyTree<'a> {
     visible_member_indices: HashMap<usize, Vec<usize>>,
     pub(super) footer: Footer<'a>,
     sort_method: ProxySort,
+    /// First visible group (in visible order) of the last rendered collapsed
+    /// window. Persisted across renders so the cursor walks the page and the
+    /// view only scrolls once a group would fall off the bottom edge.
+    pub(super) window_start: ScrollAnchor,
+    /// Same idea for the member list of the expanded group: the first visible
+    /// member row, so node navigation only scrolls once the focused node would
+    /// leave the viewport. Reset when a group is (re-)expanded.
+    pub(super) member_window_start: ScrollAnchor,
 }
+
+/// Render-time scroll anchor with interior mutability: widgets render from
+/// `&self`, and the states are shared across threads, so it must be `Sync`.
+#[derive(Debug, Default)]
+pub(super) struct ScrollAnchor(std::sync::atomic::AtomicUsize);
+
+impl ScrollAnchor {
+    pub(super) fn get(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn set(&self, value: usize) {
+        self.0.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clone for ScrollAnchor {
+    fn clone(&self) -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(self.get()))
+    }
+}
+
+impl PartialEq for ScrollAnchor {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for ScrollAnchor {}
 
 impl<'a> Default for ProxyTree<'a> {
     fn default() -> Self {
@@ -43,6 +80,8 @@ impl<'a> Default for ProxyTree<'a> {
             visible_group_indices: None,
             visible_member_indices: Default::default(),
             sort_method: Default::default(),
+            window_start: Default::default(),
+            member_window_start: Default::default(),
         };
         ret.update_footer();
         ret
@@ -175,6 +214,9 @@ impl<'a> ProxyTree<'a> {
             if let Some(query) = &self.search_query {
                 left.push(FooterItem::span(Span::styled(" SEARCH ", highlight)));
                 left.push(FooterItem::span(Span::raw(query.to_owned())).wrapped());
+                left.push(FooterItem::span(Span::styled(" Esc Cancel ", style)));
+            } else {
+                left.push(FooterItem::span(Span::styled(" / Search ", style)));
             }
 
             footer.append_left(&mut left);
@@ -218,6 +260,9 @@ impl<'a> ProxyTree<'a> {
             if let Some(query) = &self.search_query {
                 footer.push_left(FooterItem::span(Span::styled(" SEARCH ", highlight)));
                 footer.push_left(FooterItem::span(Span::raw(query.to_owned())).wrapped());
+                footer.push_left(FooterItem::span(Span::styled(" Esc Cancel ", style)));
+            } else {
+                footer.push_left(FooterItem::span(Span::styled(" / Search ", style)));
             }
 
             if let Some(ref now) = current_group.members[current_group.cursor].now {
@@ -531,7 +576,12 @@ impl<'a> MovableListManage for ProxyTree<'a> {
                         self.cursor = visible_group_indices[visible_cursor + 1];
                     }
                 }
-                KeyCode::Enter => self.expanded = true,
+                KeyCode::Enter => {
+                    self.expanded = true;
+                    // Start the member view at the top; the render pass will
+                    // scroll down to the selected node only if it overflows.
+                    self.member_window_start.set(0);
+                }
                 _ => {}
             }
         }
@@ -742,6 +792,103 @@ mod tests {
 
         tree.cancel_search();
         assert!(!tree.is_searching());
+    }
+
+    #[test]
+    fn proxy_tree_footer_hints_the_search_shortcut() {
+        let footer_text = |tree: &ProxyTree| {
+            tree.footer
+                .items()
+                .flat_map(|item| item.to_spans().0)
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        };
+
+        let mut tree = ProxyTree {
+            groups: vec![group("GlobalMedia", vec![item("racknerd")])],
+            ..ProxyTree::default()
+        };
+        tree.update_footer();
+        assert!(footer_text(&tree).contains("/ Search"));
+
+        tree.begin_search();
+        let rendered = footer_text(&tree);
+        assert!(rendered.contains("SEARCH"));
+        assert!(rendered.contains("Esc Cancel"));
+    }
+
+    #[test]
+    fn collapsed_proxy_tree_scrolls_only_when_focus_would_overflow() {
+        let mut tree = ProxyTree {
+            groups: (0..6)
+                .map(|i| group(&format!("G{i}"), vec![item("m")]))
+                .collect(),
+            ..ProxyTree::default()
+        };
+        // Inner height is 6 rows (8 minus the block border), and each collapsed
+        // group is 2 rows, so exactly three groups fit on screen.
+        let area = Rect::new(0, 0, 60, 8);
+        let render = |tree: &ProxyTree| {
+            let mut buf = Buffer::empty(area);
+            ProxyTreeWidget::new(tree).render(area, &mut buf);
+        };
+
+        // Focus inside the first screenful: nothing scrolls.
+        tree.cursor = 2;
+        render(&tree);
+        assert_eq!(tree.window_start.get(), 0);
+
+        // Focus one past the bottom edge: the window advances by a single group.
+        tree.cursor = 3;
+        render(&tree);
+        assert_eq!(tree.window_start.get(), 1);
+
+        // Moving back up but still within the window does not scroll further.
+        tree.cursor = 1;
+        render(&tree);
+        assert_eq!(tree.window_start.get(), 1);
+
+        // Moving above the window pulls it back to the top.
+        tree.cursor = 0;
+        render(&tree);
+        assert_eq!(tree.window_start.get(), 0);
+    }
+
+    #[test]
+    fn expanded_proxy_tree_scrolls_members_only_when_focus_would_overflow() {
+        let members = (0..10).map(|i| item(&format!("m{i}"))).collect::<Vec<_>>();
+        let mut tree = ProxyTree {
+            groups: vec![group("G", members)],
+            expanded: true,
+            ..ProxyTree::default()
+        };
+        // Inner height 6 (8 minus border), header takes one row, so five member
+        // rows fit on screen.
+        let area = Rect::new(0, 0, 60, 8);
+        let render = |tree: &ProxyTree| {
+            let mut buf = Buffer::empty(area);
+            ProxyTreeWidget::new(tree).render(area, &mut buf);
+        };
+
+        // Focused node within the first screenful: no scroll.
+        tree.groups[0].cursor = 4;
+        render(&tree);
+        assert_eq!(tree.member_window_start.get(), 0);
+
+        // One past the bottom edge: the member window advances by one row.
+        tree.groups[0].cursor = 5;
+        render(&tree);
+        assert_eq!(tree.member_window_start.get(), 1);
+
+        // Moving up but still inside the window does not scroll further.
+        tree.groups[0].cursor = 2;
+        render(&tree);
+        assert_eq!(tree.member_window_start.get(), 1);
+
+        // Above the window pulls it back up.
+        tree.groups[0].cursor = 0;
+        render(&tree);
+        assert_eq!(tree.member_window_start.get(), 0);
     }
 
     #[test]

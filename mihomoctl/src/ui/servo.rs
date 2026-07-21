@@ -156,36 +156,88 @@ where
     Ok(())
 }
 
+/// How long a streaming job waits before reopening a stream that dropped
+/// (e.g. after the controller restarted) to avoid busy-spinning on reconnect.
+const STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
 fn traffic_job(tx: Sender<Event>, clash: &Clash) -> TuiResult<()> {
-    let mut traffics = clash.get_traffic()?;
     loop {
-        match traffics.next() {
-            Some(Ok(traffic)) => tx.send(Event::Update(UpdateEvent::Traffic(traffic)))?,
-            Some(Err(e)) => warn!("{:?}", e),
-            None => warn!("No more traffic"),
+        let mut traffics = match clash.get_traffic() {
+            Ok(traffics) => traffics,
+            Err(e) => {
+                warn!("Failed to open traffic stream: {e}");
+                std::thread::sleep(STREAM_RECONNECT_DELAY);
+                continue;
+            }
+        };
+        loop {
+            match traffics.next() {
+                Some(Ok(traffic)) => tx.send(Event::Update(UpdateEvent::Traffic(traffic)))?,
+                Some(Err(e)) => {
+                    warn!("Traffic stream error: {e:?}");
+                    break;
+                }
+                None => {
+                    warn!("Traffic stream closed, reconnecting");
+                    break;
+                }
+            }
         }
+        std::thread::sleep(STREAM_RECONNECT_DELAY);
     }
 }
 
 fn log_job(tx: Sender<Event>, clash: &Clash) -> TuiResult<()> {
     loop {
-        let mut logs = clash.get_log()?;
-        match logs.next() {
-            Some(Ok(log)) => tx.send(Event::Update(UpdateEvent::Log(log)))?,
-            Some(Err(e)) => warn!("{:?}", e),
-            None => warn!("No more traffic"),
+        let mut logs = match clash.get_log() {
+            Ok(logs) => logs,
+            Err(e) => {
+                warn!("Failed to open log stream: {e}");
+                std::thread::sleep(STREAM_RECONNECT_DELAY);
+                continue;
+            }
+        };
+        loop {
+            match logs.next() {
+                Some(Ok(log)) => tx.send(Event::Update(UpdateEvent::Log(log)))?,
+                Some(Err(e)) => {
+                    warn!("Log stream error: {e:?}");
+                    break;
+                }
+                None => {
+                    warn!("Log stream closed, reconnecting");
+                    break;
+                }
+            }
         }
+        std::thread::sleep(STREAM_RECONNECT_DELAY);
     }
 }
 
 fn memory_job(tx: Sender<Event>, clash: &Clash) -> TuiResult<()> {
-    let mut memories = clash.get_memory()?;
     loop {
-        match memories.next() {
-            Some(Ok(memory)) => tx.send(Event::Update(UpdateEvent::Memory(memory)))?,
-            Some(Err(e)) => warn!("{:?}", e),
-            None => warn!("No more memory"),
+        let mut memories = match clash.get_memory() {
+            Ok(memories) => memories,
+            Err(e) => {
+                warn!("Failed to open memory stream: {e}");
+                std::thread::sleep(STREAM_RECONNECT_DELAY);
+                continue;
+            }
+        };
+        loop {
+            match memories.next() {
+                Some(Ok(memory)) => tx.send(Event::Update(UpdateEvent::Memory(memory)))?,
+                Some(Err(e)) => {
+                    warn!("Memory stream error: {e:?}");
+                    break;
+                }
+                None => {
+                    warn!("Memory stream closed, reconnecting");
+                    break;
+                }
+            }
         }
+        std::thread::sleep(STREAM_RECONNECT_DELAY);
     }
 }
 

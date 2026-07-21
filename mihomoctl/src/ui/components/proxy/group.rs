@@ -49,7 +49,22 @@ impl<'a> ProxyGroup<'a> {
     }
 
     pub fn get_widget(&'a self, width: usize, status: ProxyGroupFocusStatus) -> Vec<Spans<'a>> {
-        self.get_filtered_widget(width, status, None)
+        self.get_filtered_widget(width, status, None, 0)
+    }
+
+    /// Number of terminal rows this group occupies when rendered collapsed (the
+    /// non-expanded view): one header row plus the member badges wrapped into
+    /// rows. Kept in sync with the chunking in [`get_filtered_widget`] so the
+    /// tree can decide when scrolling is actually necessary.
+    pub fn collapsed_height(&self, width: usize, visible_member_indices: Option<&[usize]>) -> usize {
+        let count = visible_member_indices
+            .map(<[usize]>::len)
+            .unwrap_or_else(|| self.members.len());
+        let per_row = width
+            .saturating_sub(Consts::FOCUSED_INDICATOR_SPAN.width() + 2)
+            .saturating_div(2)
+            .max(1);
+        1 + count.div_ceil(per_row)
     }
 
     pub fn get_filtered_widget(
@@ -57,6 +72,7 @@ impl<'a> ProxyGroup<'a> {
         width: usize,
         status: ProxyGroupFocusStatus,
         visible_member_indices: Option<&[usize]>,
+        member_skip: usize,
     ) -> Vec<Spans<'a>> {
         let member_indices = visible_member_indices
             .map(<[usize]>::to_vec)
@@ -106,7 +122,7 @@ impl<'a> ProxyGroup<'a> {
         ]));
 
         if matches!(status, ProxyGroupFocusStatus::Expanded) {
-            let skipped = visible_cursor.saturating_sub(4);
+            let skipped = member_skip;
             let text_style = get_text_style();
             let is_current = |index: usize| self.current.map(|x| x == index).unwrap_or(false);
             let is_pointed = |index: usize| self.cursor == index;

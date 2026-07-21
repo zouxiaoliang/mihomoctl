@@ -62,6 +62,8 @@ where
 
     impl_setter!(pausable, pause_enabled, true);
 
+    impl_setter!(searchable, search_enabled, true);
+
     impl_setter!(items, Vec<T>);
 
     impl_setter!(padding, u16);
@@ -177,6 +179,7 @@ pub struct MovableListState<'a, T: MovableListItem<'a>, S: Default> {
     pub(super) reverse_items: bool,
     pause_enabled: bool,
     paused: bool,
+    search_enabled: bool,
     search_query: Option<String>,
     filtered_indices: Option<Vec<usize>>,
     /// First visible row of the last rendered window. Updated during render
@@ -250,6 +253,11 @@ where
     }
 
     #[inline]
+    pub fn can_search(&self) -> bool {
+        self.search_enabled
+    }
+
+    #[inline]
     pub fn is_paused(&self) -> bool {
         self.paused
     }
@@ -304,7 +312,7 @@ where
             return;
         };
         let indices = self.filtered_indices.get_or_insert_with(Vec::new);
-        if item_search_text(item).to_lowercase().contains(&query) {
+        if item.matches_query(&query) {
             indices.push(self.items.len());
         }
     }
@@ -319,12 +327,7 @@ where
             .items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| {
-                item_search_text(item)
-                    .to_lowercase()
-                    .contains(&query)
-                    .then_some(index)
-            })
+            .filter_map(|(index, item)| item.matches_query(&query).then_some(index))
             .collect::<Vec<_>>();
 
         self.filtered_indices = Some(filtered_indices);
@@ -361,17 +364,6 @@ where
             .as_ref()
             .and_then(|_| self.current_item_index())
     }
-}
-
-fn item_search_text<'a, T>(item: &T) -> String
-where
-    T: MovableListItem<'a>,
-{
-    item.to_spans()
-        .0
-        .into_iter()
-        .map(|span| span.content.into_owned())
-        .collect()
 }
 
 impl<'a, T, S> Deref for MovableListState<'a, T, S>

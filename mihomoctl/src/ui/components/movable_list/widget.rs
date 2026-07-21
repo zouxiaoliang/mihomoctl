@@ -74,10 +74,15 @@ where
             if !sort_str.is_empty() {
                 footer.push_left(tagged_footer("Sort", style, sort_str).into());
             }
-            if let Some(query) = self.state.search_query() {
-                let highlight = style.add_modifier(Modifier::BOLD);
-                footer.push_left(FooterItem::span(Span::styled(" SEARCH ", highlight)));
-                footer.push_left(FooterItem::span(Span::raw(query.to_owned())).wrapped());
+            if self.state.can_search() {
+                if let Some(query) = self.state.search_query() {
+                    let highlight = style.add_modifier(Modifier::BOLD);
+                    footer.push_left(FooterItem::span(Span::styled(" SEARCH ", highlight)));
+                    footer.push_left(FooterItem::span(Span::raw(query.to_owned())).wrapped());
+                    footer.push_left(FooterItem::span(Span::styled(" Esc Cancel ", style)));
+                } else {
+                    footer.push_left(FooterItem::span(Span::styled(" / Search ", style)));
+                }
             }
         } else {
             let style = Style::default()
@@ -104,10 +109,15 @@ where
             if !sort_str.is_empty() {
                 footer.push_left(tagged_footer("Sort", style, sort_str).into());
             }
-            if let Some(query) = self.state.search_query() {
-                let highlight = style.add_modifier(Modifier::BOLD);
-                footer.push_left(FooterItem::span(Span::styled(" SEARCH ", highlight)));
-                footer.push_left(FooterItem::span(Span::raw(query.to_owned())).wrapped());
+            if self.state.can_search() {
+                if let Some(query) = self.state.search_query() {
+                    let highlight = style.add_modifier(Modifier::BOLD);
+                    footer.push_left(FooterItem::span(Span::styled(" SEARCH ", highlight)));
+                    footer.push_left(FooterItem::span(Span::raw(query.to_owned())).wrapped());
+                    footer.push_left(FooterItem::span(Span::styled(" Esc Cancel ", style)));
+                } else {
+                    footer.push_left(FooterItem::span(Span::styled(" / Search ", style)));
+                }
             }
         }
 
@@ -392,5 +402,36 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("PAUSED"));
         assert!(rendered.contains("p Resume"));
+    }
+
+    fn footer_text(state: &MovableListState<'_, String, Noop>) -> String {
+        let area = Rect::new(0, 0, 80, 6);
+        let mut buf = Buffer::empty(area);
+        MovableList::new("List", state).render(area, &mut buf);
+        (0..area.height)
+            .map(|y| row(&buf, y, area.width))
+            .collect::<String>()
+    }
+
+    #[test]
+    fn searchable_list_hints_the_search_shortcut() {
+        let mut state: MovableListState<'_, String, Noop> =
+            MovableListState::new(vec!["row".to_owned()]);
+        state.searchable();
+        assert!(footer_text(&state).contains("/ Search"));
+
+        // Once a search is active the footer swaps the hint for the query and a
+        // cancel shortcut.
+        state.begin_search();
+        let rendered = footer_text(&state);
+        assert!(rendered.contains("SEARCH"));
+        assert!(rendered.contains("Esc Cancel"));
+    }
+
+    #[test]
+    fn non_searchable_list_omits_the_search_hint() {
+        let state: MovableListState<'_, String, Noop> =
+            MovableListState::new(vec!["row".to_owned()]);
+        assert!(!footer_text(&state).contains("/ Search"));
     }
 }

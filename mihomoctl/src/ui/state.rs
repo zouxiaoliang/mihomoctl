@@ -191,12 +191,13 @@ pub struct TuiStates<'a> {
 
     #[default(_code = "{
         let mut ret = MovableListState::default();
-        ret.with_index().dsc_index().pausable();
+        ret.with_index().dsc_index().pausable().searchable();
         ret
     }")]
     pub log_state: LogListState<'a>,
     #[default(_code = "default_connection_state()")]
     pub con_state: ConListState<'a>,
+    #[default(_code = "default_rule_state()")]
     pub rule_state: RuleListState<'a>,
     pub debug_state: DebugListState<'a>,
     #[default(_code = "api::config_core_api_state()")]
@@ -222,6 +223,7 @@ pub struct TuiStates<'a> {
 fn default_connection_state<'a>() -> ConListState<'a> {
     let mut state = MovableListState::default();
     state.pausable();
+    state.searchable();
     state.header(Spans::from(Span::styled(
         format!(
             "{:45} {:16} {:16} {:16} {:16} {:13} {:18} {:44} {}",
@@ -230,6 +232,12 @@ fn default_connection_state<'a>() -> ConListState<'a> {
         Style::default().fg(Color::DarkGray),
     )));
     state.placeholder("No active connections");
+    state
+}
+
+fn default_rule_state<'a>() -> RuleListState<'a> {
+    let mut state = MovableListState::default();
+    state.searchable();
     state
 }
 
