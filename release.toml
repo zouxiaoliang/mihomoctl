@@ -1,0 +1,36 @@
+# cargo-release configuration for the mihomoctl workspace.
+#
+# Install once:   cargo install cargo-release
+# Cut a release:  cargo release <level|version> -x
+#   e.g.          cargo release minor -x      # 0.1.1 -> 0.2.0
+#                 cargo release 0.2.0  -x      # explicit version
+# Omit `-x` for a dry run that only prints what would happen.
+
+# Every crate in the workspace shares one version and is bumped together, so
+# `mihomoctl` and `mihomoctl-core` never drift apart.
+shared-version = true
+
+# Produce a single commit and a single tag for the whole release instead of one
+# per crate.
+consolidate-commits = true
+
+# Distribution is via GitHub Releases (.github/workflows/release.yaml), not
+# crates.io, so don't publish any crate. Flip this to `true` on an individual
+# crate later if you ever want to push it to crates.io.
+publish = false
+
+# Bump the version(s), commit, tag, and push. Pushing the tag is what triggers
+# the release workflow to build and upload the binaries.
+tag = true
+push = true
+
+# One workspace-wide tag such as `v0.2.0`, matching the workflow's `tags: ["*"]`
+# trigger and its `v`-prefixed asset names — instead of cargo-release's default
+# per-crate `mihomoctl-v0.2.0` / `mihomoctl-core-v0.2.0` tags.
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+
+# Release only from the main branch, and keep the commit message consistent with
+# the existing history.
+allow-branch = ["main"]
+pre-release-commit-message = "chore: release v{{version}}"
