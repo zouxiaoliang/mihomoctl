@@ -1,5 +1,7 @@
 # Mihomoctl
 
+> TUI/CLI for [Mihomo](https://github.com/MetaCubeX/mihomo) (Clash Meta) — manage proxies, rules, and connections from the terminal.
+
 ## 简介 <a name = "about"></a>
 
 Mihomoctl 是一个易用的 TUI 与 CLI 工具，用于和 [Mihomo](https://github.com/MetaCubeX/mihomo) RESTful API 交互。
